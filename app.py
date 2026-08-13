@@ -7,7 +7,7 @@ import random
 from ortools.sat.python import cp_model
 
 # --- 설정 및 전역 변수 ---
-SHIFTS = ['D', 'E', 'N', 'O'] # O는 Off(휴무)를 의미 (X, SX, H, HX, TR 통합)
+SHIFTS = ['D', 'E', 'N', 'O'] # O는 Off(휴무)를 의미 (X, SX, H, HX, TR 등 통합)
 SHIFT_IDX = {'D': 0, 'E': 1, 'N': 2, 'O': 3}
 REV_SHIFT_IDX = {0: 'D', 1: 'E', 2: 'N', 3: 'X'}
 
@@ -21,6 +21,23 @@ def is_cell_colored(cell):
         if cell.fill.fgColor.rgb not in ['00000000', 'FFFFFFFF', None]:
             return True
     return False
+
+def parse_shift_options(val_str):
+    """쉼표로 구분된 근무 옵션을 인덱스 리스트로 변환"""
+    if not val_str or val_str == "NONE":
+        return []
+    options = []
+    for part in val_str.split(','):
+        p = part.strip().upper()
+        if p in ['D']:
+            options.append(0)
+        elif p in ['E']:
+            options.append(1)
+        elif p in ['N']:
+            options.append(2)
+        elif p in ['X', 'SX', 'H', 'HX', 'TR', 'O']:
+            options.append(3)
+    return list(set(options))
 
 def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d, min_e, max_e, min_n, max_n):
     model = cp_model.CpModel()
@@ -42,17 +59,14 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         # [A] 이전달 기록 고정
         for d in range(num_history):
             s_val = staff['history'][d]
-            s_idx = SHIFT_IDX.get(s_val, 3) # 기본값 O
+            s_idx = SHIFT_IDX.get(s_val, 3)
             model.Add(shifts[(e, d, s_idx)] == 1)
 
-        # [B] 당월 노란색 고정 근무 반영
-        for d, shift_str in staff['fixed'].items():
+        # [B] 당월 노란색 고정 근무 반영 (여러 개일 경우 그중 하나 선택)
+        for d, opt_list in staff['fixed'].items():
             abs_d = num_history + d
-            if 'D' in shift_str: s_idx = 0
-            elif 'E' in shift_str: s_idx = 1
-            elif 'N' in shift_str: s_idx = 2
-            else: s_idx = 3
-            model.Add(shifts[(e, abs_d, s_idx)] == 1)
+            if opt_list:
+                model.Add(sum(shifts[(e, abs_d, s)] for s in opt_list) == 1)
 
         # [C] 기본 규칙 (전체 기간에 대해 적용)
         for d in range(total_days):
@@ -148,13 +162,10 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
     # [F] 원티드(일반 글씨) 최대한 반영 (가산점)
     for e, staff in enumerate(staff_data):
-        for d, wanted_shifts in staff['wanted'].items():
+        for d, opt_list in staff['wanted'].items():
             abs_d = num_history + d
-            for w_shift in wanted_shifts:
-                if w_shift in SHIFT_IDX:
-                    objective_terms.append(20 * shifts[(e, abs_d, SHIFT_IDX[w_shift])])
-                elif w_shift in ['X', 'SX', 'H', 'HX', 'TR']:
-                    objective_terms.append(20 * shifts[(e, abs_d, 3)])
+            for s in opt_list:
+                objective_terms.append(15 * shifts[(e, abs_d, s)])
     
     model.Maximize(sum(objective_terms))
     solver = cp_model.CpSolver()
@@ -222,14 +233,15 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                 
         for d, col in enumerate(current_cols):
             cell = ws.cell(row=r, column=col)
-            val = str(cell.value).strip().upper() if cell.value else ""
+            val = str(cell.value).strip()
             
-            if val and val != "NONE":
-                options = [x.strip() for x in val.split(',')]
-                if is_cell_colored(cell):
-                    staff_dict['fixed'][d] = options[0]
-                else:
-                    staff_dict['wanted'][d] = options
+            if val and val.upper() != "NONE":
+                opts = parse_shift_options(val)
+                if opts:
+                    if is_cell_colored(cell):
+                        staff_dict['fixed'][d] = opts
+                    else:
+                        staff_dict['wanted'][d] = opts
                     
         staff_data.append(staff_dict)
 
@@ -250,7 +262,9 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             is_fixed = d in staff['fixed']
             
             if is_fixed:
-                val = staff['fixed'][d]
+                # 노란색 고정인 경우 첫 번째 옵션 문자열로 표시하거나 지정된 값 유지
+                cell = ws.cell(row=r, column=col)
+                val = str(cell.value).split(',')[0].strip().upper()
             else:
                 val = staff['final_schedule'].get(d, '')
                 if val == 'X' and not staff['is_male'] and 'HX' not in staff['fixed'].values() and counts['HX'] == 0:
@@ -260,12 +274,11 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                 cell.value = val
                 cell.fill = blue_fill 
                 
-            cell = ws.cell(row=r, column=col)
             cell.alignment = center_align
                 
             if val in counts:
                 counts[val] += 1
-            elif val in ['O', 'TR']:
+            elif val in ['O', 'TR', 'SX', 'H']:
                 counts['X'] += 1
                 
         for key, col in summary_cols.items():
