@@ -72,7 +72,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         for d in range(total_days - 3):
             # 4. 나이트(N)는 최대 3일 연속까지만
             model.Add(sum(shifts[(e, d+i, 2)] for i in range(4)) <= 3)
-
+            
         for d in range(total_days - 2):
             # 5. N 근무 후 최소 2일 오프 (N -> O -> 일 금지)
             # N(d) + O(d+1) + 일(d+2) <= 2  => 일(d+2)는 (1 - O(d+2))
