@@ -91,8 +91,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.Add(shifts[(e, d, 2)] + shifts[(e, d+1, 3)] + (1 - shifts[(e, d+2, 3)]) <= 2)
 
         for d in range(total_days - 2):
-            # 수정사항 1: D -> E -> N 연속 패턴 자제 (D(d) + E(d+1) + N(d+2) <= 2)
-            model.Add(shifts[(e, d, 0)] + shifts[(e, d+1, 1)] + scholarship_fix(shifts, e, d+2, 2) <= 2) if False else \
+            # 수정사항 1: D -> E -> N 연속 패턴 방지
             model.Add(shifts[(e, d, 0)] + shifts[(e, d+1, 1)] + shifts[(e, d+2, 2)] <= 2)
 
         for d in range(1, total_days - 1):
@@ -106,12 +105,10 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-20 * single_x) 
 
-        # [D] 당월 월간 오프 목표 (H, TR 등 제외한 순수 X/HX 계열 대상)
-        # 고정된 H나 TR 개수를 제외한 나머지 목표 오프 설정
-        fixed_h_tr = sum(1 for d, opts in staff['fixed'].items() if 3 in opts and any(x in str(staff['fixed_raw'].get(d,'')) for x in ['H', 'TR']))
+        # [D] 당월 월간 오프 목표 (H, TR 등 제외한 순수 X 계열 대상)
         target_offs = int(base_x_count) if staff['is_male'] else int(base_x_count) + 1
-        
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
+        
         model.Add(off_count >= target_offs - 2)
         model.Add(off_count <= target_offs + 2)
         
@@ -189,9 +186,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
     else:
         return False
 
-def scholarship_fix(shifts, e, d, s):
-    return shifts[(e, d, s)]
-
 
 def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_n, max_n):
     wb = openpyxl.load_workbook(io.BytesIO(file_content))
@@ -230,7 +224,6 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             'is_sub_leader': name in SUB_LEADER,
             'history': [],
             'fixed': {},
-            'fixed_raw': {},
             'wanted': {},
             'final_schedule': {}
         }
@@ -251,7 +244,6 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                 if opts:
                     if is_cell_colored(cell):
                         staff_dict['fixed'][d] = opts
-                        staff_dict['fixed_raw'][d] = val
                     else:
                         staff_dict['wanted'][d] = opts
                     
@@ -274,20 +266,17 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             is_fixed = d in staff['fixed']
             
             if is_fixed:
-                # 노란색 고정인 경우 첫 번째 옵션 문자열로 표시
                 cell = ws.cell(row=r, column=col)
-                raw_val = str(staff['fixed_raw'][d])
-                # 쉼표가 있으면 첫 번째 것 또는 그대로 유지, 원본 유지
+                raw_val = str(cell.value)
+                # 노란색 칸의 복수 옵션 중 첫 번째 값(또는 원본 첫 항목)으로 셀에 보기 좋게 확정 표시
                 val = raw_val.split(',')[0].strip().upper()
-                if val in ['X', 'SX', 'HX', 'TR']:
-                    val = 'X' # 기본 집계용
+                if val in ['X', 'SX', 'HX', 'TR', 'XX']:
+                    val = 'X'
             else:
-                # AI가 채운 값 (고정이 아닌 경우)
                 chosen_idx = staff['final_schedule'].get(d, 3)
                 val = REV_SHIFT_IDX[chosen_idx]
-                
-                # 여자의 경우 HX 처리 (매달 HX 1개 필수)
-                if val == 'X' and not staff['is_male'] and 'HX' not in [str(v).upper() for v in staff['fixed_raw'].values()] and counts['HX'] == 0:
+                if val == 'X' and not staff['is_male'] and counts['HX'] == 0:
+                    # 여성의 경우 한 달에 HX 1개 배정 체크
                     val = 'HX'
                 
                 cell = ws.cell(row=r, column=col)
@@ -296,23 +285,21 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                 
             cell.alignment = center_align
                 
-            # 카운트 집계 (H, TR 등 예외 처리 정확히)
+            # 카운트 집계 (수정사항 4 반영: H, TR 등 정확한 분류)
             raw_cell_val = str(ws.cell(row=r, column=col).value).strip().upper()
-            if raw_cell_val in ['H']:
+            if 'H' in raw_cell_val and 'HX' not in raw_cell_val:
                 counts['H'] += 1
-            elif raw_cell_val in ['HX']:
+            elif 'HX' in raw_cell_val:
                 counts['HX'] += 1
-            elif raw_cell_val in ['SX']:
+            elif 'SX' in raw_cell_val:
                 counts['SX'] += 1
-            elif raw_cell_val in ['TR']:
-                # TR은 통계 열에 어떻게 반영할지 선택 (보통 X나 별도 집계, 여기서는 X 또는 그대로)
-                counts['X'] += 1
+            elif 'TR' in raw_cell_val:
+                pass # TR은 X 개수에서 제외
             elif val in counts:
                 counts[val] += 1
             elif val in ['X', 'O']:
                 counts['X'] += 1
                 
-        # 요약 열에 데이터 쓰기
         for key, col in summary_cols.items():
             if key == '총합':
                 ws.cell(row=r, column=col).value = sum(counts.values())
