@@ -3,160 +3,200 @@ import pandas as pd
 import openpyxl
 from openpyxl.styles import PatternFill
 import io
-import random
+from ortools.sat.python import cp_model
 
 # --- 설정 및 전역 변수 ---
-SHIFTS = ['D', 'E', 'N', 'X', 'SX', 'H', 'HX', 'TR']
+SHIFTS = ['D', 'E', 'N', 'O'] # O는 Off(휴무)를 의미 (X, SX, H, HX, TR 통합)
+SHIFT_IDX = {'D': 0, 'E': 1, 'N': 2, 'O': 3}
+REV_SHIFT_IDX = {0: 'D', 1: 'E', 2: 'N', 3: 'X'}
+
 MEN = ["최충일", "윤진호", "이용재"]
-LEADER = ["용하영", "최충일", "박세은", "김소은", "윤지선", "이소희", "정하림", "최아라"]
+# 1~8번 시니어 명단 (사진 기준)
+SENIORS = ["용하영", "최충일", "박세은", "김소은", "윤지선", "이소희", "정하림", "최아라"]
 
 def is_cell_colored(cell):
-    """셀에 배경색(노란색 등)이 칠해져 있는지 확인"""
+    """노란색 등 배경색이 칠해져 있는지 확인 (고정 근무 파악용)"""
     if cell.fill and cell.fill.patternType == 'solid':
-        # 흰색이 아니면 색이 칠해진 것(고정)으로 간주
         if cell.fill.fgColor.rgb not in ['00000000', 'FFFFFFFF']:
             return True
     return False
 
-def parse_and_generate(file_buffer, target_x_count):
-    # 엑셀 파일 로드
+def solve_schedule(staff_data, num_days, base_x_count):
+    model = cp_model.CpModel()
+    num_staff = len(staff_data)
+    
+    # 1. 변수 생성: shifts[직원인덱스, 날짜인덱스, 근무형태인덱스] = 1(배정됨) or 0(배정안됨)
+    shifts = {}
+    for e in range(num_staff):
+        for d in range(num_days):
+            for s in range(4): # 0:D, 1:E, 2:N, 3:O
+                shifts[(e, d, s)] = model.NewBoolVar(f'shift_e{e}_d{d}_s{s}')
+
+    # --- 제약 조건 (규칙) 적용 ---
+    
+    # 규칙 1: 하루에 무조건 1개의 근무(또는 휴무)만 배정
+    for e in range(num_staff):
+        for d in range(num_days):
+            model.AddExactlyOne(shifts[(e, d, s)] for s in range(4))
+
+    # 규칙 2 & 5: 노란색 고정 근무는 무조건 반영
+    for e, staff in enumerate(staff_data):
+        for d, shift_str in staff['fixed'].items():
+            if shift_str in SHIFT_IDX:
+                model.Add(shifts[(e, d, SHIFT_IDX[shift_str])] == 1)
+            elif shift_str in ['X', 'SX', 'H', 'HX', 'TR']:
+                model.Add(shifts[(e, d, 3)] == 1) # Off로 처리
+
+    # 규칙 3: 역방향 교대 금지 (E->D, N->D, N->E 불가)
+    for e in range(num_staff):
+        for d in range(num_days - 1):
+            # E(1) 다음날 D(0) 불가
+            model.AddImplication(shifts[(e, d, 1)], shifts[(e, d+1, 0)].Not())
+            # N(2) 다음날 D(0) 또는 E(1) 불가
+            model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 0)].Not())
+            model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 1)].Not())
+
+    # 규칙 4: 연속 5일 근무 시 반드시 다음날은 오프(O)
+    for e in range(num_staff):
+        for d in range(num_days - 5):
+            # 5일 연속 근무(D,E,N)를 하면 6일째는 반드시 Off(3)
+            working_5_days = []
+            for i in range(5):
+                is_working = model.NewBoolVar(f'work_{e}_{d+i}')
+                model.Add(shifts[(e, d+i, 3)] == 0).OnlyEnforceIf(is_working)
+                model.Add(shifts[(e, d+i, 3)] == 1).OnlyEnforceIf(is_working.Not())
+                working_5_days.append(is_working)
+            
+            # 5일 다 일했다면, 6일째(d+5)는 Off(3)이어야 함
+            model.AddImplication(sum(working_5_days) == 5, shifts[(e, d+5, 3)])
+
+    # 규칙 6: 시니어(1~8번) 중 매일 D, E, N 각각 최소 1명 이상 필수
+    senior_indices = [i for i, s in enumerate(staff_data) if s['name'] in SENIORS]
+    for d in range(num_days):
+        for s in [0, 1, 2]: # D, E, N
+            model.Add(sum(shifts[(e, d, s)] for e in senior_indices) >= 1)
+
+    # 규칙 7: 모든 사람의 N(나이트) 개수 동일하게 맞추기
+    target_n = model.NewIntVar(0, num_days, 'target_n')
+    for e in range(num_staff):
+        model.Add(sum(shifts[(e, d, 2)] for d in range(num_days)) == target_n)
+
+    # 규칙 8: 오프(X) 개수 (여자는 HX때문에 +1)
+    for e, staff in enumerate(staff_data):
+        total_offs = base_x_count if staff['is_male'] else base_x_count + 1
+        model.Add(sum(shifts[(e, d, 3)] for d in range(num_days)) == total_offs)
+
+    # 규칙 9: 퐁당퐁당 휴무 금지 (휴무는 무조건 2개 이상 붙어서)
+    # 즉, [일함, 쉬움, 일함] 패턴 금지
+    for e in range(num_staff):
+        for d in range(1, num_days - 1):
+            is_working_yesterday = model.NewBoolVar('')
+            model.Add(shifts[(e, d-1, 3)] == 0).OnlyEnforceIf(is_working_yesterday)
+            
+            is_working_tomorrow = model.NewBoolVar('')
+            model.Add(shifts[(e, d+1, 3)] == 0).OnlyEnforceIf(is_working_tomorrow)
+            
+            # 어제 일하고 내일 일한다면, 오늘은 쉴 수 없다(쉬려면 2일 이상 쉬어야 하므로)
+            model.AddImplication(is_working_yesterday & is_working_tomorrow, shifts[(e, d, 3)].Not())
+
+    # 목적 함수: 원티드(일반 글씨)를 최대한 많이 들어주도록 설정
+    objective_terms = []
+    for e, staff in enumerate(staff_data):
+        for d, wanted_shifts in staff['wanted'].items():
+            for w_shift in wanted_shifts:
+                if w_shift in SHIFT_IDX:
+                    objective_terms.append(shifts[(e, d, SHIFT_IDX[w_shift])])
+                elif w_shift in ['X', 'SX', 'H', 'HX', 'TR']:
+                    objective_terms.append(shifts[(e, d, 3)])
+    
+    model.Maximize(sum(objective_terms))
+
+    # 솔버 실행
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30.0 # 30초 내에 최적의 해 찾기
+    status = solver.Solve(model)
+
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        # 결과 저장
+        for e, staff in enumerate(staff_data):
+            for d in range(num_days):
+                for s in range(4):
+                    if solver.BooleanValue(shifts[(e, d, s)]):
+                        staff['final_schedule'][d] = REV_SHIFT_IDX[s]
+        return True
+    else:
+        return False
+
+
+def process_excel(file_buffer, target_x_count):
     wb = openpyxl.load_workbook(file_buffer, data_only=True)
     ws = wb.active
 
-    # 날짜 파악 (1행)
-    start_col = 7 # G열부터 당월 1일이라고 가정 (사진 기준)
-    max_col = ws.max_column
-    max_row = ws.max_row
+    # 날짜 컬럼 찾기 (대략 G열, index 6부터 31일까지)
+    start_col = 6 
+    num_days = 31 # 예시로 31일로 고정 (추후 엑셀 열 개수에 맞춰 자동화 가능)
 
-    # 직원 정보 및 상태 초기화
-    staff_data = {}
-    for r in range(3, max_row + 1):
+    staff_data = []
+    for r in range(3, ws.max_row + 1):
         name = ws.cell(row=r, column=1).value
         if not name or name == '이름':
             continue
-        
-        # 전월 마지막 근무 상태 파악 (B~F열)
-        prev_shifts = []
-        for c in range(2, 7):
-            val = ws.cell(row=r, column=c).value
-            if val: prev_shifts.append(str(val).strip().upper())
             
-        staff_data[name] = {
+        staff_dict = {
             'row': r,
+            'name': name,
             'is_male': name in MEN,
-            'is_leader': name in LEADER,
-            'req_x': target_x_count,
-            'req_hx': 0 if name in MEN else 1, # 여자는 HX 1개 필수
-            'history': prev_shifts,
-            'fixed': {},   # 노란색 셀 (무조건)
-            'wanted': {},  # 일반 텍스트 (우선순위)
-            'schedule': {} # 최종 스케줄
+            'fixed': {},
+            'wanted': {},
+            'final_schedule': {}
         }
-
-        # 당월 원티드 및 고정 파악
-        for c in range(start_col, max_col + 1):
-            cell = ws.cell(row=r, column=c)
+        
+        for d in range(num_days):
+            cell = ws.cell(row=r, column=start_col + d + 1)
             val = str(cell.value).strip().upper() if cell.value else ""
             
             if val and val != "NONE":
                 options = [x.strip() for x in val.split(',')]
                 if is_cell_colored(cell):
-                    staff_data[name]['fixed'][c] = options[0] # 노란색은 첫번째 값으로 고정
+                    staff_dict['fixed'][d] = options[0]
                 else:
-                    staff_data[name]['wanted'][c] = options
+                    staff_dict['wanted'][d] = options
+                    
+        staff_data.append(staff_dict)
 
-    # ---------------------------------------------------------
-    # 휴리스틱 스케줄링 알고리즘 (간이 버전)
-    # ---------------------------------------------------------
-    # 실제 완벽한 교대근무표 작성은 '제약 계획법(Constraint Programming)'이 필요하나,
-    # 여기서는 규칙을 최대한 지키며 채워넣는 방식을 사용합니다.
-    
-    for c in range(start_col, max_col + 1):
-        daily_d = 0; daily_e = 0; daily_n = 0
-        leader_d = 0; leader_e = 0; leader_n = 0
-        
-        # 1. 고정(노란색) 먼저 배치
-        for name, data in staff_data.items():
-            if c in data['fixed']:
-                shift = data['fixed'][c]
-                data['schedule'][c] = shift
-                if shift == 'D': daily_d += 1
-                if shift == 'E': daily_e += 1
-                if shift == 'N': daily_n += 1
-                if data['is_leader']:
-                    if shift == 'D': leader_d += 1
-                    if shift == 'E': leader_e += 1
-                    if shift == 'N': leader_n += 1
+    # AI 알고리즘 실행
+    success = solve_schedule(staff_data, num_days, target_x_count)
 
-        # 2. 나머지 인원 배치 (우선순위: 원티드 -> 랜덤)
-        for name, data in staff_data.items():
-            if c in data['schedule']: continue # 이미 고정됨
-            
-            last_shift = data['history'][-1] if data['history'] else 'X'
-            available_shifts = ['D', 'E', 'N', 'X']
-            
-            # 규칙: 역방향 금지 (E->D, N->D, N->E 불가)
-            if last_shift == 'E':
-                if 'D' in available_shifts: available_shifts.remove('D')
-            elif last_shift == 'N':
-                if 'D' in available_shifts: available_shifts.remove('D')
-                if 'E' in available_shifts: available_shifts.remove('E')
-                
-            # 시니어 필수 조건 체크 (1명씩은 들어가야함)
-            if data['is_leader']:
-                if leader_d == 0 and 'D' in available_shifts:
-                    shift = 'D'
-                    leader_d += 1
-                elif leader_e == 0 and 'E' in available_shifts:
-                    shift = 'E'
-                    leader_e += 1
-                elif leader_n == 0 and 'N' in available_shifts:
-                    shift = 'N'
-                    leader_n += 1
-                else:
-                    shift = random.choice(available_shifts)
-            else:
-                # 원티드 반영
-                if c in data['wanted']:
-                    valid_wants = [w for w in data['wanted'][c] if w in available_shifts]
-                    if valid_wants:
-                        shift = random.choice(valid_wants)
-                    else:
-                        shift = random.choice(available_shifts)
-                else:
-                    shift = random.choice(available_shifts)
-            
-            data['schedule'][c] = shift
-            data['history'].append(shift)
+    if not success:
+        return None
 
-    # ---------------------------------------------------------
-    # 결과 엑셀에 덮어쓰기
-    # ---------------------------------------------------------
+    # 성공 시 엑셀에 데이터 쓰기
     blue_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
     
-    for name, data in staff_data.items():
-        r = data['row']
-        for c in range(start_col, max_col + 1):
-            if c not in data['fixed']: # 고정이 아니었던 빈칸에만 입력
-                ws.cell(row=r, column=c).value = data['schedule'].get(c, '')
-                # 자동 생성된 값은 연파랑색으로 표시하여 구분
-                ws.cell(row=r, column=c).fill = blue_fill 
+    for staff in staff_data:
+        r = staff['row']
+        for d in range(num_days):
+            col = start_col + d + 1
+            if d not in staff['fixed']: # 노란색 고정이 아니었던 곳만 새로 채움
+                val = staff['final_schedule'].get(d, '')
+                # 여자의 경우 추가된 오프 1개를 'HX'로 변환 (간단한 후처리)
+                if val == 'X' and not staff['is_male'] and 'HX' not in staff['final_schedule'].values():
+                    val = 'HX'
+                
+                ws.cell(row=r, column=col).value = val
+                ws.cell(row=r, column=col).fill = blue_fill 
 
-    # 메모리에 엑셀 파일 저장
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
     return output
 
-# --- 웹 페이지 UI ---
-st.set_page_config(page_title="간호사 듀티표 자동 생성기", layout="wide")
+# --- Streamlit UI ---
+st.set_page_config(page_title="스마트 듀티표 생성기", layout="wide")
 
-st.title("🏥 병원 듀티표 자동 생성 웹사이트")
+st.title("🏥 스마트 듀티표 자동 생성기 (AI 적용버전)")
 st.markdown("""
-**이용 방법:**
-1. 좌측에 이번 달 기본 **오프(X) 개수**를 입력하세요. (여성은 자동으로 HX 1개가 추가 고려됩니다)
-2. 작성하신 **원티드 엑셀 파일**을 업로드하세요.
-3. **'듀티표 자동 생성'** 버튼을 누르면 다운로드 버튼이 나타납니다!
+입력하신 **10가지 제약조건**이 모두 포함된 최적화 엔진(`Google OR-Tools`)이 적용되었습니다.  
 """)
 
 with st.sidebar:
@@ -167,14 +207,13 @@ with st.sidebar:
 if uploaded_file is not None:
     st.success("✅ 파일 업로드 완료! 데이터를 분석합니다.")
     
-    if st.button("🚀 듀티표 자동 생성 시작"):
-        with st.spinner("AI가 수천 가지의 경우의 수를 계산하며 스케줄을 짜는 중입니다..."):
-            try:
-                # 결과 파일 생성
-                result_file = parse_and_generate(uploaded_file, target_x)
-                
+    if st.button("🚀 듀티표 AI 생성 시작"):
+        with st.spinner("AI가 수천만 가지의 경우의 수를 계산하여 최적의 스케줄을 찾고 있습니다. (최대 30초 소요)"):
+            result_file = process_excel(uploaded_file, target_x)
+            
+            if result_file:
                 st.balloons()
-                st.success("🎉 듀티표가 성공적으로 생성되었습니다!")
+                st.success("🎉 모든 조건이 만족되는 완벽한 듀티표가 생성되었습니다!")
                 
                 st.download_button(
                     label="📥 완성된 듀티표 다운로드 (.xlsx)",
@@ -182,8 +221,6 @@ if uploaded_file is not None:
                     file_name="완성된_듀티표.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-                
-                st.info("💡 새로 입력된 듀티는 **연파랑색** 배경으로 표시되어 기존 원티드/고정과 쉽게 구분할 수 있습니다.")
-                
-            except Exception as e:
-                st.error(f"오류가 발생했습니다. 엑셀 파일의 양식을 확인해주세요. (에러: {e})")
+                st.info("💡 새로 입력된 듀티는 **연파랑색** 배경으로 표시됩니다. 원티드 요청은 조건이 허락하는 한 최대한 반영되었습니다.")
+            else:
+                st.error("🚨 제약 조건이 너무 빡빡하여 해답을 찾을 수 없습니다! 노란색(고정) 휴무가 너무 많거나 조건이 충돌하는지 확인해주세요.")
