@@ -102,6 +102,13 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             
         # 한 사람당 D-E-N 패턴은 최대 2번까지만 허용
         model.Add(sum(den_patterns) <= 2)
+        
+        # ★ 새로운 수정사항: 5일 연속 동일 근무(DDDDD, EEEEE) 최대한 자제 (-80점 페널티)
+        for d in range(total_days - 4):
+            for s in [0, 1]:  # D(0)와 E(1)에 대해서만 적용 (N은 이미 하드제약으로 3일까지 제한됨)
+                five_same = model.NewBoolVar(f'five_same_e{e}_d{d}_s{s}')
+                model.AddMinEquality(five_same, [shifts[(e, d+i, s)] for i in range(5)])
+                objective_terms.append(-80 * five_same)
 
         for d in range(1, total_days - 1):
             # 독성 퐁당퐁당(Single X) 패턴 절대 금지: E-X-D, N-X-D, N-X-E
@@ -201,8 +208,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 for s in range(4):
                     if solver.Value(shifts[(e, num_history + d, s)]) == 1:
-                        # 에러 E 완벽 해결: 문자가 아니라 인덱스 숫자(s)만 정확히 저장합니다!
-                        staff['final_schedule'][d] = s
+                        staff['final_schedule'][d] = REV_SHIFT_IDX[s]
         return True
     else:
         return False
@@ -289,19 +295,18 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             is_fixed = d in staff['fixed']
             
             cell = ws.cell(row=r, column=col)
-            chosen_idx = staff['final_schedule'].get(d, 3)
+            
+            # AI가 배정한 값
+            val = staff['final_schedule'].get(d, 'X')
             
             if is_fixed:
                 raw_opts = [p.strip().upper() for p in str(staff['fixed_raw'].get(d, '')).split(',')]
-                val = REV_SHIFT_IDX[chosen_idx]
                 for p in raw_opts:
-                    if chosen_idx == 0 and 'D' in p: val = p
-                    elif chosen_idx == 1 and 'E' in p: val = p
-                    elif chosen_idx == 2 and 'N' in p: val = p
-                    elif chosen_idx == 3 and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): 
-                        val = p
+                    if val == 'D' and 'D' in p and 'DE' not in p: val = p; break
+                    elif val == 'E' and 'E' in p: val = p; break
+                    elif val == 'N' and 'N' in p: val = p; break
+                    elif val == 'X' and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): val = p; break
             else:
-                val = REV_SHIFT_IDX[chosen_idx]
                 has_hx = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
                 if val == 'X' and not staff['is_male'] and counts.get('HX', 0) == 0 and not has_hx:
                     val = 'HX'
@@ -311,7 +316,6 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             cell.value = val
             cell.alignment = center_align
                 
-            # 카운트 집계
             raw_cell_val = str(val).strip().upper()
             if raw_cell_val == 'D': counts['D'] = counts.get('D', 0) + 1
             elif raw_cell_val == 'E': counts['E'] = counts.get('E', 0) + 1
