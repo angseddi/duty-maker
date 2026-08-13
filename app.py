@@ -35,7 +35,7 @@ def parse_shift_options(val_str):
             options.append(1)
         elif 'N' in p:
             options.append(2)
-        # 수정사항 3, 4 반영: 기타(교육휴가) 및 XX 텍스트 대응 추가
+        # 수정사항: 기타(교육휴가) 및 XX 텍스트 대응 추가
         elif 'X' in p or 'H' in p or 'TR' in p or 'SX' in p or 'O' in p or '기타' in p or '교육' in p:
             options.append(3)
         elif p == 'D':
@@ -117,7 +117,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             
             # 수정사항 2 반영: 비근무 사이 근무 하나만 껴있는 퐁당퐁당 근무(O-W-O) 최대한 자제 (-80점)
             single_work = model.NewBoolVar(f'single_work_{e}_{d}')
-            # 휴무(d-1) + 근무(d) + 휴무(d+1) 인 경우에만 single_work가 1이 됨
             model.Add(single_work >= shifts[(e, d-1, 3)] + (1 - shifts[(e, d, 3)]) + shifts[(e, d+1, 3)] - 2)
             objective_terms.append(-80 * single_work)
 
@@ -210,6 +209,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 for s in range(4):
                     if solver.Value(shifts[(e, num_history + d, s)]) == 1:
+                        # 에러 E 완벽 해결: 사전을 거치지 않고 바로 D, E, N, X 문자열을 저장!
                         staff['final_schedule'][d] = REV_SHIFT_IDX[s]
         return True
     else:
@@ -295,22 +295,20 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
         for d in range(num_days):
             col = current_cols[d]
             is_fixed = d in staff['fixed']
-            
             cell = ws.cell(row=r, column=col)
-            chosen_idx = staff['final_schedule'].get(d, 3)
+            
+            # AI가 배정한 값 (D, E, N, X 중 하나)
+            val = staff['final_schedule'].get(d, 'X')
             
             if is_fixed:
+                # 사용자가 입력한 여러 문자열 중, AI가 고른 것과 일치하는 텍스트 찾기
                 raw_opts = [p.strip().upper() for p in str(staff['fixed_raw'].get(d, '')).split(',')]
-                val = REV_SHIFT_IDX[chosen_idx]
                 for p in raw_opts:
-                    if chosen_idx == 0 and 'D' in p: val = p
-                    elif chosen_idx == 1 and 'E' in p: val = p
-                    elif chosen_idx == 2 and 'N' in p: val = p
-                    # 기타, XX 등도 알맞게 출력 (수정사항 3, 4 처리)
-                    elif chosen_idx == 3 and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): 
-                        val = p
+                    if val == 'D' and 'D' in p and 'DE' not in p: val = p; break
+                    elif val == 'E' and 'E' in p: val = p; break
+                    elif val == 'N' and 'N' in p: val = p; break
+                    elif val == 'X' and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): val = p; break
             else:
-                val = REV_SHIFT_IDX[chosen_idx]
                 has_hx = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
                 if val == 'X' and not staff['is_male'] and counts.get('HX', 0) == 0 and not has_hx:
                     val = 'HX'
@@ -320,7 +318,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             cell.value = val
             cell.alignment = center_align
                 
-            # 카운트 집계 (수정사항 3, 4 반영: TR, 기타, XX 등을 독립적으로 정확히 집계)
+            # 카운트 집계 (KeyError 방지를 위해 get() 사용 및 TR/교육 휴가 분리)
             raw_cell_val = str(val).strip().upper()
             if raw_cell_val == 'D': counts['D'] = counts.get('D', 0) + 1
             elif raw_cell_val == 'E': counts['E'] = counts.get('E', 0) + 1
@@ -329,9 +327,9 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             elif raw_cell_val == 'HX': counts['HX'] = counts.get('HX', 0) + 1
             elif raw_cell_val == 'SX': counts['SX'] = counts.get('SX', 0) + 1
             elif 'TR' in raw_cell_val or '기타' in raw_cell_val or '교육' in raw_cell_val: 
-                counts['I'] = counts.get('I', 0) + 1 # TR/기타는 I 통계로 처리
+                counts['I'] = counts.get('I', 0) + 1 # TR, 기타(교육휴가)는 I로 집계
             elif raw_cell_val in ['X', 'O', 'XX']: 
-                counts['X'] = counts.get('X', 0) + 1 # XX는 X와 동일하게 집계
+                counts['X'] = counts.get('X', 0) + 1 # XX는 X와 동일하게 처리
             else: 
                 counts['X'] = counts.get('X', 0) + 1
                 
