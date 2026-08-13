@@ -123,7 +123,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         fixed_h_tr_count = 0
         for raw_val in staff.get('fixed_raw', {}).values():
             opts = [p.strip().upper() for p in str(raw_val).split(',')]
-            # 'XX'는 포함 안되므로 순수 X로 취급, H/TR/기타 등만 개수 차감용으로 확인
             if any(p in ['H', 'TR'] or '기타' in p or '교육' in p for p in opts):
                 fixed_h_tr_count += 1
                 
@@ -133,7 +132,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
         
-        # ★ 새로운 수정사항: X 개수 완벽 통일 (무조건 일치해야 함)
+        # X 개수 완벽 통일
         model.Add(off_count == target_offs)
 
         # D와 E 갯수 비슷하게 맞추기
@@ -202,7 +201,8 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 for s in range(4):
                     if solver.Value(shifts[(e, num_history + d, s)]) == 1:
-                        staff['final_schedule'][d] = REV_SHIFT_IDX[s]
+                        # 에러 E 완벽 해결: 문자가 아니라 인덱스 숫자(s)만 정확히 저장합니다!
+                        staff['final_schedule'][d] = s
         return True
     else:
         return False
@@ -311,6 +311,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             cell.value = val
             cell.alignment = center_align
                 
+            # 카운트 집계
             raw_cell_val = str(val).strip().upper()
             if raw_cell_val == 'D': counts['D'] = counts.get('D', 0) + 1
             elif raw_cell_val == 'E': counts['E'] = counts.get('E', 0) + 1
@@ -338,10 +339,9 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
     return output
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="스마트 듀티표 생성기", layout="wide")
+st.set_page_config(page_title="근무표 자동 생성 프로그램", layout="wide")
 
-st.title("🏥 스마트 듀티표 자동 생성기")
-st.markdown("입력하신 **제약조건**과 **리더/보조리더** 규칙을 모두 반영한 인공지능 최적화 모델입니다.")
+st.title("🏥 근무표 자동 생성 프로그램")
 
 with st.sidebar:
     st.header("⚙️ 기본 설정")
@@ -366,8 +366,8 @@ with st.sidebar:
 if uploaded_file is not None:
     st.success("✅ 파일 업로드 완료! 데이터를 분석합니다.")
     
-    if st.button("🚀 듀티표 AI 생성 시작"):
-        with st.spinner("AI가 수천만 가지의 경우의 수를 계산하여 최적의 스케줄을 찾고 있습니다. (최대 120초 소요)"):
+    if st.button("🚀 듀티표 생성 시작"):
+        with st.spinner("수천만 가지의 경우의 수를 계산하여 최적의 스케줄을 찾고 있습니다. (최대 120초 소요)"):
             try:
                 result_file = process_excel(uploaded_file.getvalue(), target_x, min_d, max_d, min_e, max_e, min_n, max_n)
                 
@@ -381,7 +381,7 @@ if uploaded_file is not None:
                         file_name="완성된_듀티표.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
-                    st.info("💡 새로 입력된 듀티는 **연파랑색** 배경으로 표시됩니다. 오른쪽에 근무 갯수 통계도 자동으로 입력되었습니다.")
+                    st.info("💡 새로 입력된 듀티는 **연파랑색** 배경으로 표시됩니다.")
                 else:
                     st.error("🚨 제약 조건이 너무 빡빡하여 해답을 찾을 수 없습니다! 설정하신 최소/최대 인원을 조절하거나 원티드를 확인해주세요.")
             except Exception as e:
