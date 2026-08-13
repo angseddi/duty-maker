@@ -35,7 +35,6 @@ def parse_shift_options(val_str):
             options.append(1)
         elif 'N' in p:
             options.append(2)
-        # 수정사항: 기타(교육휴가) 및 XX 텍스트 대응 추가
         elif 'X' in p or 'H' in p or 'TR' in p or 'SX' in p or 'O' in p or '기타' in p or '교육' in p:
             options.append(3)
         elif p == 'D':
@@ -95,7 +94,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
         den_patterns = []
         for d in range(total_days - 2):
-            # 수정사항 1 반영: D -> E -> N 연속 근무 한달 1~2번으로 허용하되 가급적 자제 (페널티)
+            # D -> E -> N 연속 근무 한달 1~2번으로 허용하되 가급적 자제 (페널티)
             den_pattern = model.NewBoolVar(f'den_{e}_{d}')
             model.AddBoolOr([shifts[(e, d, 0)].Not(), shifts[(e, d+1, 1)].Not(), shifts[(e, d+2, 2)].Not(), den_pattern])
             objective_terms.append(-30 * den_pattern) 
@@ -115,13 +114,12 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-100 * single_x) 
             
-            # 수정사항 2 반영: 비근무 사이 근무 하나만 껴있는 퐁당퐁당 근무(O-W-O) 최대한 자제 (-80점)
+            # 비근무 사이 근무 하나만 껴있는 퐁당퐁당 근무(O-W-O) 최대한 자제 (-80점)
             single_work = model.NewBoolVar(f'single_work_{e}_{d}')
             model.Add(single_work >= shifts[(e, d-1, 3)] + (1 - shifts[(e, d, 3)]) + shifts[(e, d+1, 3)] - 2)
             objective_terms.append(-80 * single_work)
 
         # [D] 당월 월간 목표 오프 카운트 산정
-        # 수정사항 3, 4 반영: TR, H, 기타 등은 X 카운트 목표에서 제외되도록 보정
         fixed_h_tr_count = 0
         for raw_val in staff.get('fixed_raw', {}).values():
             opts = [p.strip().upper() for p in str(raw_val).split(',')]
@@ -135,13 +133,8 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
         
-        model.Add(off_count >= target_offs - 1)
-        model.Add(off_count <= target_offs + 1)
-        
-        diff_off = model.NewIntVar(0, num_days, f'diff_off_{e}')
-        model.Add(diff_off >= off_count - target_offs)
-        model.Add(diff_off >= target_offs - off_count)
-        objective_terms.append(-30 * diff_off)
+        # ★ 새로운 수정사항: X 개수 완벽 통일 (무조건 일치해야 함)
+        model.Add(off_count == target_offs)
 
         # D와 E 갯수 비슷하게 맞추기
         d_count = sum(shifts[(e, num_history + d, 0)] for d in range(num_days))
@@ -162,7 +155,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             if leader_and_sub_indices:
                 model.Add(sum(shifts[(e, abs_d, s)] for e in leader_and_sub_indices) >= 1)
             
-            # 소프트 제약: 수정사항 5 반영 ('찐' 리더가 들어가면 아주 강력한 100점 가산점 부여)
+            # 소프트 제약: '찐' 리더가 들어가면 아주 강력한 100점 가산점 부여
             if leader_indices:
                 has_leader = model.NewBoolVar(f'has_leader_d{abs_d}_s{s}')
                 model.Add(sum(shifts[(e, abs_d, s)] for e in leader_indices) >= 1).OnlyEnforceIf(has_leader)
@@ -209,7 +202,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 for s in range(4):
                     if solver.Value(shifts[(e, num_history + d, s)]) == 1:
-                        # 에러 E 완벽 해결: 사전을 거치지 않고 바로 D, E, N, X 문자열을 저장!
                         staff['final_schedule'][d] = REV_SHIFT_IDX[s]
         return True
     else:
@@ -295,20 +287,21 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
         for d in range(num_days):
             col = current_cols[d]
             is_fixed = d in staff['fixed']
-            cell = ws.cell(row=r, column=col)
             
-            # AI가 배정한 값 (D, E, N, X 중 하나)
-            val = staff['final_schedule'].get(d, 'X')
+            cell = ws.cell(row=r, column=col)
+            chosen_idx = staff['final_schedule'].get(d, 3)
             
             if is_fixed:
-                # 사용자가 입력한 여러 문자열 중, AI가 고른 것과 일치하는 텍스트 찾기
                 raw_opts = [p.strip().upper() for p in str(staff['fixed_raw'].get(d, '')).split(',')]
+                val = REV_SHIFT_IDX[chosen_idx]
                 for p in raw_opts:
-                    if val == 'D' and 'D' in p and 'DE' not in p: val = p; break
-                    elif val == 'E' and 'E' in p: val = p; break
-                    elif val == 'N' and 'N' in p: val = p; break
-                    elif val == 'X' and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): val = p; break
+                    if chosen_idx == 0 and 'D' in p: val = p
+                    elif chosen_idx == 1 and 'E' in p: val = p
+                    elif chosen_idx == 2 and 'N' in p: val = p
+                    elif chosen_idx == 3 and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): 
+                        val = p
             else:
+                val = REV_SHIFT_IDX[chosen_idx]
                 has_hx = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
                 if val == 'X' and not staff['is_male'] and counts.get('HX', 0) == 0 and not has_hx:
                     val = 'HX'
@@ -318,7 +311,6 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             cell.value = val
             cell.alignment = center_align
                 
-            # 카운트 집계 (KeyError 방지를 위해 get() 사용 및 TR/교육 휴가 분리)
             raw_cell_val = str(val).strip().upper()
             if raw_cell_val == 'D': counts['D'] = counts.get('D', 0) + 1
             elif raw_cell_val == 'E': counts['E'] = counts.get('E', 0) + 1
@@ -327,9 +319,9 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             elif raw_cell_val == 'HX': counts['HX'] = counts.get('HX', 0) + 1
             elif raw_cell_val == 'SX': counts['SX'] = counts.get('SX', 0) + 1
             elif 'TR' in raw_cell_val or '기타' in raw_cell_val or '교육' in raw_cell_val: 
-                counts['I'] = counts.get('I', 0) + 1 # TR, 기타(교육휴가)는 I로 집계
+                counts['I'] = counts.get('I', 0) + 1 
             elif raw_cell_val in ['X', 'O', 'XX']: 
-                counts['X'] = counts.get('X', 0) + 1 # XX는 X와 동일하게 처리
+                counts['X'] = counts.get('X', 0) + 1 
             else: 
                 counts['X'] = counts.get('X', 0) + 1
                 
