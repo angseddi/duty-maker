@@ -24,18 +24,18 @@ def is_cell_colored(cell):
 
 def parse_shift_options(val_str):
     """쉼표로 구분된 근무 옵션을 인덱스 리스트로 변환"""
-    if not val_str or val_str.upper() == "NONE":
+    if not val_str or str(val_str).strip().upper() == "NONE":
         return []
     options = []
-    for part in val_str.split(','):
+    for part in str(val_str).split(','):
         p = part.strip().upper()
-        if p == 'D':
+        if 'D' in p:
             options.append(0)
-        elif p == 'E':
+        elif 'E' in p:
             options.append(1)
-        elif p == 'N':
+        elif 'N' in p:
             options.append(2)
-        elif p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX']:
+        elif 'X' in p or 'H' in p or 'TR' in p or 'SX' in p or 'O' in p:
             options.append(3)
     return list(set(options))
 
@@ -91,7 +91,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.Add(shifts[(e, d, 2)] + shifts[(e, d+1, 3)] + (1 - shifts[(e, d+2, 3)]) <= 2)
 
         for d in range(total_days - 2):
-            # 수정사항 1: D -> E -> N 연속 패턴 방지
+            # D -> E -> N 연속 패턴 방지
             model.Add(shifts[(e, d, 0)] + shifts[(e, d+1, 1)] + shifts[(e, d+2, 2)] <= 2)
 
         for d in range(1, total_days - 1):
@@ -105,7 +105,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-20 * single_x) 
 
-        # [D] 당월 월간 오프 목표 (H, TR 등 제외한 순수 X 계열 대상)
+        # [D] 당월 월간 오프 목표
         target_offs = int(base_x_count) if staff['is_male'] else int(base_x_count) + 1
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
         
@@ -132,11 +132,9 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
     for d in range(num_days):
         abs_d = num_history + d
         for s in [0, 1, 2]: # D, E, N
-            # 하드 제약: 리더+보조리더 그룹에서 최소 1명은 무조건 필수
             if leader_and_sub_indices:
                 model.Add(sum(shifts[(e, abs_d, s)] for e in leader_and_sub_indices) >= 1)
             
-            # 소프트 제약: '찐' 리더가 들어가면 가산점 부여 (리더 우선 배치)
             if leader_indices:
                 leader_count = sum(shifts[(e, abs_d, s)] for e in leader_indices)
                 objective_terms.append(25 * leader_count)
@@ -224,6 +222,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             'is_sub_leader': name in SUB_LEADER,
             'history': [],
             'fixed': {},
+            'fixed_raw': {},
             'wanted': {},
             'final_schedule': {}
         }
@@ -244,6 +243,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                 if opts:
                     if is_cell_colored(cell):
                         staff_dict['fixed'][d] = opts
+                        staff_dict['fixed_raw'][d] = val
                     else:
                         staff_dict['wanted'][d] = opts
                     
@@ -265,39 +265,42 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             col = current_cols[d]
             is_fixed = d in staff['fixed']
             
+            cell = ws.cell(row=r, column=col)
+            
             if is_fixed:
-                cell = ws.cell(row=r, column=col)
                 raw_val = str(cell.value)
-                # 노란색 칸의 복수 옵션 중 첫 번째 값(또는 원본 첫 항목)으로 셀에 보기 좋게 확정 표시
+                # 노란색 칸의 복수 옵션 중 첫 번째 값(또는 유효한 첫 항목) 표시
                 val = raw_val.split(',')[0].strip().upper()
-                if val in ['X', 'SX', 'HX', 'TR', 'XX']:
-                    val = 'X'
             else:
                 chosen_idx = staff['final_schedule'].get(d, 3)
                 val = REV_SHIFT_IDX[chosen_idx]
-                if val == 'X' and not staff['is_male'] and counts['HX'] == 0:
-                    # 여성의 경우 한 달에 HX 1개 배정 체크
+                if val == 'X' and not staff['is_male'] and counts['HX'] == 0 and not any('HX' in str(v).upper() for v in staff['fixed_raw'].values()):
                     val = 'HX'
                 
-                cell = ws.cell(row=r, column=col)
                 cell.value = val
                 cell.fill = blue_fill 
                 
             cell.alignment = center_align
                 
-            # 카운트 집계 (수정사항 4 반영: H, TR 등 정확한 분류)
-            raw_cell_val = str(ws.cell(row=r, column=col).value).strip().upper()
-            if 'H' in raw_cell_val and 'HX' not in raw_cell_val:
-                counts['H'] += 1
-            elif 'HX' in raw_cell_val:
+            # 카운트 집계 (H, HX, SX, TR, D, E, N, X 안전하게 분류)
+            raw_cell_val = str(cell.value).strip().upper()
+            if 'HX' in raw_cell_val:
                 counts['HX'] += 1
+            elif 'H' in raw_cell_val:
+                counts['H'] += 1
             elif 'SX' in raw_cell_val:
                 counts['SX'] += 1
             elif 'TR' in raw_cell_val:
-                pass # TR은 X 개수에서 제외
-            elif val in counts:
-                counts[val] += 1
-            elif val in ['X', 'O']:
+                counts['I'] += 1 # TR은 I 또는 별도 처리
+            elif raw_cell_val == 'D':
+                counts['D'] += 1
+            elif raw_cell_val == 'E':
+                counts['E'] += 1
+            elif raw_cell_val == 'N':
+                counts['N'] += 1
+            elif raw_cell_val in ['X', 'O', 'XX']:
+                counts['X'] += 1
+            else:
                 counts['X'] += 1
                 
         for key, col in summary_cols.items():
