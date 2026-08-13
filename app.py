@@ -24,18 +24,18 @@ def is_cell_colored(cell):
 
 def parse_shift_options(val_str):
     """쉼표로 구분된 근무 옵션을 인덱스 리스트로 변환"""
-    if not val_str or val_str == "NONE":
+    if not val_str or val_str.upper() == "NONE":
         return []
     options = []
     for part in val_str.split(','):
         p = part.strip().upper()
-        if p in ['D']:
+        if p == 'D':
             options.append(0)
-        elif p in ['E']:
+        elif p == 'E':
             options.append(1)
-        elif p in ['N']:
+        elif p == 'N':
             options.append(2)
-        elif p in ['X', 'SX', 'H', 'HX', 'TR', 'O']:
+        elif p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX']:
             options.append(3)
     return list(set(options))
 
@@ -62,7 +62,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             s_idx = SHIFT_IDX.get(s_val, 3)
             model.Add(shifts[(e, d, s_idx)] == 1)
 
-        # [B] 당월 노란색 고정 근무 반영 (여러 개일 경우 그중 하나 선택)
+        # [B] 당월 노란색 고정 근무 반영 (여러 개일 경우 그 중 하나 선택)
         for d, opt_list in staff['fixed'].items():
             abs_d = num_history + d
             if opt_list:
@@ -90,6 +90,11 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             # N 근무 후 최소 2일 오프 (N -> O -> 일 금지)
             model.Add(shifts[(e, d, 2)] + shifts[(e, d+1, 3)] + (1 - shifts[(e, d+2, 3)]) <= 2)
 
+        for d in range(total_days - 2):
+            # 수정사항 1: D -> E -> N 연속 패턴 자제 (D(d) + E(d+1) + N(d+2) <= 2)
+            model.Add(shifts[(e, d, 0)] + shifts[(e, d+1, 1)] + scholarship_fix(shifts, e, d+2, 2) <= 2) if False else \
+            model.Add(shifts[(e, d, 0)] + shifts[(e, d+1, 1)] + shifts[(e, d+2, 2)] <= 2)
+
         for d in range(1, total_days - 1):
             # 독성 퐁당퐁당(Single X) 패턴 절대 금지: E-X-D, N-X-D, N-X-E
             model.AddBoolOr([shifts[(e, d-1, 1)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
@@ -101,12 +106,14 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-20 * single_x) 
 
-        # [D] 당월 월간 목표 (당월 기간만 계산)
+        # [D] 당월 월간 오프 목표 (H, TR 등 제외한 순수 X/HX 계열 대상)
+        # 고정된 H나 TR 개수를 제외한 나머지 목표 오프 설정
+        fixed_h_tr = sum(1 for d, opts in staff['fixed'].items() if 3 in opts and any(x in str(staff['fixed_raw'].get(d,'')) for x in ['H', 'TR']))
         target_offs = int(base_x_count) if staff['is_male'] else int(base_x_count) + 1
-        off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
         
-        model.Add(off_count >= target_offs - 1)
-        model.Add(off_count <= target_offs + 1)
+        off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
+        model.Add(off_count >= target_offs - 2)
+        model.Add(off_count <= target_offs + 2)
         
         diff_off = model.NewIntVar(0, num_days, f'diff_off_{e}')
         model.Add(diff_off >= off_count - target_offs)
@@ -182,6 +189,9 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
     else:
         return False
 
+def scholarship_fix(shifts, e, d, s):
+    return shifts[(e, d, s)]
+
 
 def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_n, max_n):
     wb = openpyxl.load_workbook(io.BytesIO(file_content))
@@ -220,6 +230,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             'is_sub_leader': name in SUB_LEADER,
             'history': [],
             'fixed': {},
+            'fixed_raw': {},
             'wanted': {},
             'final_schedule': {}
         }
@@ -240,6 +251,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                 if opts:
                     if is_cell_colored(cell):
                         staff_dict['fixed'][d] = opts
+                        staff_dict['fixed_raw'][d] = val
                     else:
                         staff_dict['wanted'][d] = opts
                     
@@ -262,12 +274,20 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             is_fixed = d in staff['fixed']
             
             if is_fixed:
-                # 노란색 고정인 경우 첫 번째 옵션 문자열로 표시하거나 지정된 값 유지
+                # 노란색 고정인 경우 첫 번째 옵션 문자열로 표시
                 cell = ws.cell(row=r, column=col)
-                val = str(cell.value).split(',')[0].strip().upper()
+                raw_val = str(staff['fixed_raw'][d])
+                # 쉼표가 있으면 첫 번째 것 또는 그대로 유지, 원본 유지
+                val = raw_val.split(',')[0].strip().upper()
+                if val in ['X', 'SX', 'HX', 'TR']:
+                    val = 'X' # 기본 집계용
             else:
-                val = staff['final_schedule'].get(d, '')
-                if val == 'X' and not staff['is_male'] and 'HX' not in staff['fixed'].values() and counts['HX'] == 0:
+                # AI가 채운 값 (고정이 아닌 경우)
+                chosen_idx = staff['final_schedule'].get(d, 3)
+                val = REV_SHIFT_IDX[chosen_idx]
+                
+                # 여자의 경우 HX 처리 (매달 HX 1개 필수)
+                if val == 'X' and not staff['is_male'] and 'HX' not in [str(v).upper() for v in staff['fixed_raw'].values()] and counts['HX'] == 0:
                     val = 'HX'
                 
                 cell = ws.cell(row=r, column=col)
@@ -276,11 +296,23 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                 
             cell.alignment = center_align
                 
-            if val in counts:
+            # 카운트 집계 (H, TR 등 예외 처리 정확히)
+            raw_cell_val = str(ws.cell(row=r, column=col).value).strip().upper()
+            if raw_cell_val in ['H']:
+                counts['H'] += 1
+            elif raw_cell_val in ['HX']:
+                counts['HX'] += 1
+            elif raw_cell_val in ['SX']:
+                counts['SX'] += 1
+            elif raw_cell_val in ['TR']:
+                # TR은 통계 열에 어떻게 반영할지 선택 (보통 X나 별도 집계, 여기서는 X 또는 그대로)
+                counts['X'] += 1
+            elif val in counts:
                 counts[val] += 1
-            elif val in ['O', 'TR', 'SX', 'H']:
+            elif val in ['X', 'O']:
                 counts['X'] += 1
                 
+        # 요약 열에 데이터 쓰기
         for key, col in summary_cols.items():
             if key == '총합':
                 ws.cell(row=r, column=col).value = sum(counts.values())
