@@ -29,7 +29,7 @@ def parse_shift_options(val_str):
     options = []
     for part in str(val_str).split(','):
         p = part.strip().upper()
-        if 'D' in p:
+        if 'D' in p and 'DE' not in p:
             options.append(0)
         elif 'E' in p:
             options.append(1)
@@ -37,7 +37,13 @@ def parse_shift_options(val_str):
             options.append(2)
         elif 'X' in p or 'H' in p or 'TR' in p or 'SX' in p or 'O' in p:
             options.append(3)
-    return list(set(options))
+        elif p == 'D':
+            options.append(0)
+        elif p == 'E':
+            options.append(1)
+        elif p == 'N':
+            options.append(2)
+    return list(set(options)) if options else [3]
 
 def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d, min_e, max_e, min_n, max_n):
     model = cp_model.CpModel()
@@ -194,16 +200,18 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
     summary_cols = {}
     
     for col in range(2, ws.max_column + 1):
-        v1 = str(ws.cell(row=1, column=col).value).strip()
-        v2 = str(ws.cell(row=2, column=col).value).strip()
+        v1 = ws.cell(row=1, column=col).value
+        v2 = ws.cell(row=2, column=col).value
+        v1_str = str(v1).strip().upper() if v1 is not None else ""
+        v2_str = str(v2).strip() if v2 is not None else ""
         
-        if v2 in days_of_week:
+        if v2_str in days_of_week:
             cal_cols.append(col)
-        elif v1 in ['D', 'E', 'N', 'X', 'H', 'HX', 'SX', 'I', '총합']:
-            summary_cols[v1] = col
+        elif v1_str in ['D', 'E', 'N', 'X', 'H', 'HX', 'SX', 'I', '총합']:
+            summary_cols[v1_str] = col
 
-    history_cols = cal_cols[:5]
-    current_cols = cal_cols[5:]
+    history_cols = cal_cols[:5] if len(cal_cols) >= 5 else cal_cols[:1]
+    current_cols = cal_cols[5:] if len(cal_cols) >= 5 else cal_cols[1:]
     num_history = len(history_cols)
     num_days = len(current_cols)
 
@@ -269,12 +277,11 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             
             if is_fixed:
                 raw_val = str(cell.value)
-                # 노란색 칸의 복수 옵션 중 첫 번째 값(또는 유효한 첫 항목) 표시
                 val = raw_val.split(',')[0].strip().upper()
             else:
                 chosen_idx = staff['final_schedule'].get(d, 3)
                 val = REV_SHIFT_IDX[chosen_idx]
-                if val == 'X' and not staff['is_male'] and counts['HX'] == 0 and not any('HX' in str(v).upper() for v in staff['fixed_raw'].values()):
+                if val == 'X' and not staff['is_male'] and counts.get('HX', 0) == 0 and not any('HX' in str(v).upper() for v in staff['fixed_raw'].values()):
                     val = 'HX'
                 
                 cell.value = val
@@ -282,32 +289,29 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                 
             cell.alignment = center_align
                 
-            # 카운트 집계 (H, HX, SX, TR, D, E, N, X 안전하게 분류)
             raw_cell_val = str(cell.value).strip().upper()
             if 'HX' in raw_cell_val:
-                counts['HX'] += 1
+                counts['HX'] = counts.get('HX', 0) + 1
             elif 'H' in raw_cell_val:
-                counts['H'] += 1
+                counts['H'] = counts.get('H', 0) + 1
             elif 'SX' in raw_cell_val:
-                counts['SX'] += 1
+                counts['SX'] = counts.get('SX', 0) + 1
             elif 'TR' in raw_cell_val:
-                counts['I'] += 1 # TR은 I 또는 별도 처리
+                counts['I'] = counts.get('I', 0) + 1
             elif raw_cell_val == 'D':
-                counts['D'] += 1
+                counts['D'] = counts.get('D', 0) + 1
             elif raw_cell_val == 'E':
-                counts['E'] += 1
+                counts['E'] = counts.get('E', 0) + 1
             elif raw_cell_val == 'N':
-                counts['N'] += 1
-            elif raw_cell_val in ['X', 'O', 'XX']:
-                counts['X'] += 1
+                counts['N'] = counts.get('N', 0) + 1
             else:
-                counts['X'] += 1
+                counts['X'] = counts.get('X', 0) + 1
                 
         for key, col in summary_cols.items():
             if key == '총합':
                 ws.cell(row=r, column=col).value = sum(counts.values())
             elif key in counts:
-                ws.cell(row=r, column=col).value = counts[key]
+                ws.cell(row=r, column=col).value = counts.get(key, 0)
             ws.cell(row=r, column=col).alignment = center_align
 
     output = io.BytesIO()
