@@ -8,7 +8,7 @@ import random
 # --- 설정 및 전역 변수 ---
 SHIFTS = ['D', 'E', 'N', 'X', 'SX', 'H', 'HX', 'TR']
 MEN = ["최충일", "윤진호", "이용재"]
-SENIORS = ["용하영", "최충일", "박세은", "김소은", "윤지선", "이소희", "정하림", "최아라"]
+LEADER = ["용하영", "최충일", "박세은", "김소은", "윤지선", "이소희", "정하림", "최아라"]
 
 def is_cell_colored(cell):
     """셀에 배경색(노란색 등)이 칠해져 있는지 확인"""
@@ -44,7 +44,7 @@ def parse_and_generate(file_buffer, target_x_count):
         staff_data[name] = {
             'row': r,
             'is_male': name in MEN,
-            'is_senior': name in SENIORS,
+            'is_leader': name in LEADER,
             'req_x': target_x_count,
             'req_hx': 0 if name in MEN else 1, # 여자는 HX 1개 필수
             'history': prev_shifts,
@@ -73,7 +73,7 @@ def parse_and_generate(file_buffer, target_x_count):
     
     for c in range(start_col, max_col + 1):
         daily_d = 0; daily_e = 0; daily_n = 0
-        senior_d = 0; senior_e = 0; senior_n = 0
+        leader_d = 0; leader_e = 0; leader_n = 0
         
         # 1. 고정(노란색) 먼저 배치
         for name, data in staff_data.items():
@@ -83,10 +83,10 @@ def parse_and_generate(file_buffer, target_x_count):
                 if shift == 'D': daily_d += 1
                 if shift == 'E': daily_e += 1
                 if shift == 'N': daily_n += 1
-                if data['is_senior']:
-                    if shift == 'D': senior_d += 1
-                    if shift == 'E': senior_e += 1
-                    if shift == 'N': senior_n += 1
+                if data['is_leader']:
+                    if shift == 'D': leader_d += 1
+                    if shift == 'E': leader_e += 1
+                    if shift == 'N': leader_n += 1
 
         # 2. 나머지 인원 배치 (우선순위: 원티드 -> 랜덤)
         for name, data in staff_data.items():
@@ -103,16 +103,16 @@ def parse_and_generate(file_buffer, target_x_count):
                 if 'E' in available_shifts: available_shifts.remove('E')
                 
             # 시니어 필수 조건 체크 (1명씩은 들어가야함)
-            if data['is_senior']:
-                if senior_d == 0 and 'D' in available_shifts:
+            if data['is_leader']:
+                if leader_d == 0 and 'D' in available_shifts:
                     shift = 'D'
-                    senior_d += 1
-                elif senior_e == 0 and 'E' in available_shifts:
+                    leader_d += 1
+                elif leader_e == 0 and 'E' in available_shifts:
                     shift = 'E'
-                    senior_e += 1
-                elif senior_n == 0 and 'N' in available_shifts:
+                    leader_e += 1
+                elif leader_n == 0 and 'N' in available_shifts:
                     shift = 'N'
-                    senior_n += 1
+                    leader_n += 1
                 else:
                     shift = random.choice(available_shifts)
             else:
