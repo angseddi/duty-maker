@@ -24,26 +24,20 @@ def is_cell_colored(cell):
 
 def parse_shift_options(val_str):
     """쉼표로 구분된 근무 옵션을 인덱스 리스트로 변환"""
-    if not val_str or str(val_str).strip().upper() == "NONE":
+    if not val_str or val_str == "NONE":
         return []
     options = []
-    for part in str(val_str).split(','):
+    for part in val_str.split(','):
         p = part.strip().upper()
-        if 'D' in p and 'DE' not in p:
+        if p in ['D']:
             options.append(0)
-        elif 'E' in p:
+        elif p in ['E']:
             options.append(1)
-        elif 'N' in p:
+        elif p in ['N']:
             options.append(2)
-        elif 'X' in p or 'H' in p or 'TR' in p or 'SX' in p or 'O' in p:
+        elif p in ['X', 'SX', 'H', 'HX', 'TR', 'O']:
             options.append(3)
-        elif p == 'D':
-            options.append(0)
-        elif p == 'E':
-            options.append(1)
-        elif p == 'N':
-            options.append(2)
-    return list(set(options)) if options else [3]
+    return list(set(options))
 
 def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d, min_e, max_e, min_n, max_n):
     model = cp_model.CpModel()
@@ -68,7 +62,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             s_idx = SHIFT_IDX.get(s_val, 3)
             model.Add(shifts[(e, d, s_idx)] == 1)
 
-        # [B] 당월 노란색 고정 근무 반영 (여러 개일 경우 그 중 하나 선택)
+        # [B] 당월 노란색 고정 근무 반영 (여러 개일 경우 그중 하나 선택)
         for d, opt_list in staff['fixed'].items():
             abs_d = num_history + d
             if opt_list:
@@ -96,10 +90,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             # N 근무 후 최소 2일 오프 (N -> O -> 일 금지)
             model.Add(shifts[(e, d, 2)] + shifts[(e, d+1, 3)] + (1 - shifts[(e, d+2, 3)]) <= 2)
 
-        for d in range(total_days - 2):
-            # D -> E -> N 연속 패턴 방지
-            model.Add(shifts[(e, d, 0)] + shifts[(e, d+1, 1)] + shifts[(e, d+2, 2)] <= 2)
-
         for d in range(1, total_days - 1):
             # 독성 퐁당퐁당(Single X) 패턴 절대 금지: E-X-D, N-X-D, N-X-E
             model.AddBoolOr([shifts[(e, d-1, 1)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
@@ -111,12 +101,12 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-20 * single_x) 
 
-        # [D] 당월 월간 오프 목표
+        # [D] 당월 월간 목표 (당월 기간만 계산)
         target_offs = int(base_x_count) if staff['is_male'] else int(base_x_count) + 1
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
         
-        model.Add(off_count >= target_offs - 2)
-        model.Add(off_count <= target_offs + 2)
+        model.Add(off_count >= target_offs - 1)
+        model.Add(off_count <= target_offs + 1)
         
         diff_off = model.NewIntVar(0, num_days, f'diff_off_{e}')
         model.Add(diff_off >= off_count - target_offs)
@@ -138,9 +128,11 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
     for d in range(num_days):
         abs_d = num_history + d
         for s in [0, 1, 2]: # D, E, N
+            # 하드 제약: 리더+보조리더 그룹에서 최소 1명은 무조건 필수
             if leader_and_sub_indices:
                 model.Add(sum(shifts[(e, abs_d, s)] for e in leader_and_sub_indices) >= 1)
             
+            # 소프트 제약: '찐' 리더가 들어가면 가산점 부여 (리더 우선 배치)
             if leader_indices:
                 leader_count = sum(shifts[(e, abs_d, s)] for e in leader_indices)
                 objective_terms.append(25 * leader_count)
@@ -200,18 +192,16 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
     summary_cols = {}
     
     for col in range(2, ws.max_column + 1):
-        v1 = ws.cell(row=1, column=col).value
-        v2 = ws.cell(row=2, column=col).value
-        v1_str = str(v1).strip().upper() if v1 is not None else ""
-        v2_str = str(v2).strip() if v2 is not None else ""
+        v1 = str(ws.cell(row=1, column=col).value).strip()
+        v2 = str(ws.cell(row=2, column=col).value).strip()
         
-        if v2_str in days_of_week:
+        if v2 in days_of_week:
             cal_cols.append(col)
-        elif v1_str in ['D', 'E', 'N', 'X', 'H', 'HX', 'SX', 'I', '총합']:
-            summary_cols[v1_str] = col
+        elif v1 in ['D', 'E', 'N', 'X', 'H', 'HX', 'SX', 'I', '총합']:
+            summary_cols[v1] = col
 
-    history_cols = cal_cols[:5] if len(cal_cols) >= 5 else cal_cols[:1]
-    current_cols = cal_cols[5:] if len(cal_cols) >= 5 else cal_cols[1:]
+    history_cols = cal_cols[:5]
+    current_cols = cal_cols[5:]
     num_history = len(history_cols)
     num_days = len(current_cols)
 
@@ -230,7 +220,6 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             'is_sub_leader': name in SUB_LEADER,
             'history': [],
             'fixed': {},
-            'fixed_raw': {},
             'wanted': {},
             'final_schedule': {}
         }
@@ -251,7 +240,6 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                 if opts:
                     if is_cell_colored(cell):
                         staff_dict['fixed'][d] = opts
-                        staff_dict['fixed_raw'][d] = val
                     else:
                         staff_dict['wanted'][d] = opts
                     
@@ -273,45 +261,31 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             col = current_cols[d]
             is_fixed = d in staff['fixed']
             
-            cell = ws.cell(row=r, column=col)
-            
             if is_fixed:
-                raw_val = str(cell.value)
-                val = raw_val.split(',')[0].strip().upper()
+                # 노란색 고정인 경우 첫 번째 옵션 문자열로 표시하거나 지정된 값 유지
+                cell = ws.cell(row=r, column=col)
+                val = str(cell.value).split(',')[0].strip().upper()
             else:
-                chosen_idx = staff['final_schedule'].get(d, 3)
-                val = REV_SHIFT_IDX[chosen_idx]
-                if val == 'X' and not staff['is_male'] and counts.get('HX', 0) == 0 and not any('HX' in str(v).upper() for v in staff['fixed_raw'].values()):
+                val = staff['final_schedule'].get(d, '')
+                if val == 'X' and not staff['is_male'] and 'HX' not in staff['fixed'].values() and counts['HX'] == 0:
                     val = 'HX'
                 
+                cell = ws.cell(row=r, column=col)
                 cell.value = val
                 cell.fill = blue_fill 
                 
             cell.alignment = center_align
                 
-            raw_cell_val = str(cell.value).strip().upper()
-            if 'HX' in raw_cell_val:
-                counts['HX'] = counts.get('HX', 0) + 1
-            elif 'H' in raw_cell_val:
-                counts['H'] = counts.get('H', 0) + 1
-            elif 'SX' in raw_cell_val:
-                counts['SX'] = counts.get('SX', 0) + 1
-            elif 'TR' in raw_cell_val:
-                counts['I'] = counts.get('I', 0) + 1
-            elif raw_cell_val == 'D':
-                counts['D'] = counts.get('D', 0) + 1
-            elif raw_cell_val == 'E':
-                counts['E'] = counts.get('E', 0) + 1
-            elif raw_cell_val == 'N':
-                counts['N'] = counts.get('N', 0) + 1
-            else:
-                counts['X'] = counts.get('X', 0) + 1
+            if val in counts:
+                counts[val] += 1
+            elif val in ['O', 'TR', 'SX', 'H']:
+                counts['X'] += 1
                 
         for key, col in summary_cols.items():
             if key == '총합':
                 ws.cell(row=r, column=col).value = sum(counts.values())
             elif key in counts:
-                ws.cell(row=r, column=col).value = counts.get(key, 0)
+                ws.cell(row=r, column=col).value = counts[key]
             ws.cell(row=r, column=col).alignment = center_align
 
     output = io.BytesIO()
