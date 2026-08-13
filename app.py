@@ -12,7 +12,6 @@ SHIFT_IDX = {'D': 0, 'E': 1, 'N': 2, 'O': 3}
 REV_SHIFT_IDX = {0: 'D', 1: 'E', 2: 'N', 3: 'X'}
 
 MEN = ["최충일", "윤진호", "이용재"]
-# 6번 조건: 리더와 보조리더 분리
 LEADER = ["용하영", "최충일", "박세은", "김소은", "윤지선", "이소희", "정하림", "최아라"]
 SUB_LEADER = ["김민지", "박우영", "오지은"]
 
@@ -34,96 +33,111 @@ def solve_schedule(staff_data, num_days, base_x_count, min_d, min_e, min_n):
             for s in range(4): # 0:D, 1:E, 2:N, 3:O
                 shifts[(e, d, s)] = model.NewBoolVar(f'shift_e{e}_d{d}_s{s}')
 
-    # --- 제약 조건 (하드 제약) 적용 ---
-    
+    objective_terms = []
+
+    # --- 제약 조건 (하드 제약) ---
     for e in range(num_staff):
-        # 규칙 1: 하루에 무조건 1개의 근무(또는 휴무)만 배정
+        # 1. 하루에 1개 근무만 배정
         for d in range(num_days):
             model.AddExactlyOne(shifts[(e, d, s)] for s in range(4))
 
-        # 규칙 3: 역방향 교대 금지 (E->D, N->D, N->E 불가)
+        # 2. 역방향 교대 금지 (E->D, N->D, N->E 불가)
         for d in range(num_days - 1):
             model.AddImplication(shifts[(e, d, 1)], shifts[(e, d+1, 0)].Not())
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 0)].Not())
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 1)].Not())
 
-        # 규칙 4: 연속 5일 근무 시 반드시 다음날은 오프(O) (최대 5일 연속 근무)
+        # 3. 최대 5일 연속 근무 허용 (6일 연속 금지)
         for d in range(num_days - 5):
             model.Add(sum(shifts[(e, d+i, 3)] for i in range(6)) >= 1)
 
-        # 규칙 7: 나이트(N)는 최대 3일까지만 연속 가능
+        # 4. 나이트(N)는 최대 3일 연속까지만
         for d in range(num_days - 3):
             model.Add(sum(shifts[(e, d+i, 2)] for i in range(4)) <= 3)
             
-        # 규칙 7-2: N 근무 후에는 최소 2일 이상 휴무
+        # 5. N 근무 후 최소 2일 오프 (N -> O -> 일 금지)
         for d in range(num_days - 2):
             model.Add(shifts[(e, d, 2)] + shifts[(e, d+1, 3)] + (1 - shifts[(e, d+2, 3)]) <= 2)
 
-        # 규칙 8: 오프(X) 개수 맞추기 (여자는 HX때문에 +1)
+        # 6. 오프(X) 개수 맞추기 (여유분 ±1 허용하여 에러 방지)
         target_offs = base_x_count if staff_data[e]['is_male'] else base_x_count + 1
-        model.Add(sum(shifts[(e, d, 3)] for d in range(num_days)) == target_offs)
+        off_count = sum(shifts[(e, d, 3)] for d in range(num_days))
+        model.Add(off_count >= target_offs - 1)
+        model.Add(off_count <= target_offs + 1)
+        
+        # 정확히 오프 개수를 맞추면 점수 부여 (소프트 제약)
+        is_perfect_off = model.NewBoolVar(f'perf_off_{e}')
+        model.Add(off_count == target_offs).OnlyEnforceIf(is_perfect_off)
+        objective_terms.append(50 * is_perfect_off)
 
-        # 규칙 9: 퐁당퐁당 휴무 금지 (일 -> O -> 일 금지)
+        # 7. 퐁당퐁당(Single X) 휴무 조건
         for d in range(1, num_days - 1):
-            model.Add((1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) <= 2)
+            # E-X-D, N-X-D, N-X-E 절대 금지 (하드 제약)
+            model.AddBoolOr([shifts[(e, d-1, 1)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()]) # E-X-D 금지
+            model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()]) # N-X-D 금지
+            model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 1)].Not()]) # N-X-E 금지
+            
+            # Single X 자체는 허용하되, 발생 시 페널티 부과 (어쩔 수 없을 때만 발생하도록)
+            single_x_penalty = model.NewBoolVar(f'single_x_pen_{e}_{d}')
+            model.Add(single_x_penalty >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
+            objective_terms.append(-30 * single_x_penalty) 
 
-    # 규칙 5: 노란색 고정 근무는 무조건 반영
+    # 8. 노란색 고정 근무 반영
     for e, staff in enumerate(staff_data):
         for d, shift_str in staff['fixed'].items():
             if shift_str in SHIFT_IDX:
                 model.Add(shifts[(e, d, SHIFT_IDX[shift_str])] == 1)
             elif shift_str in ['X', 'SX', 'H', 'HX', 'TR']:
-                model.Add(shifts[(e, d, 3)] == 1)
+                model.Add(shifts[(e, d, 3)] == 1) 
 
-    # 기본 근무자 수 보장
+    # 9. 리더 + 보조리더 배치
+    leader_and_sub_indices = [i for i, s in enumerate(staff_data) if s['name'] in LEADER + SUB_LEADER]
+    leader_indices = [i for i, s in enumerate(staff_data) if s['name'] in LEADER]
+    
+    if len(leader_and_sub_indices) > 0:
+        for d in range(num_days):
+            for s in [0, 1, 2]: # D, E, N
+                # 하드 제약: 리더+보조리더 그룹에서 최소 1명은 무조건 있어야 함
+                model.Add(sum(shifts[(e, d, s)] for e in leader_and_sub_indices) >= 1)
+                
+                # 소프트 제약: '찐' 리더가 들어가면 가산점 부여 (보조리더보다 찐 리더를 우선 배치)
+                has_real_leader = model.NewBoolVar(f'real_leader_d{d}_s{s}')
+                model.Add(sum(shifts[(e, d, s)] for e in leader_indices) >= 1).OnlyEnforceIf(has_real_leader)
+                model.Add(sum(shifts[(e, d, s)] for e in leader_indices) == 0).OnlyEnforceIf(has_real_leader.Not())
+                objective_terms.append(20 * has_real_leader)
+
+    # 10. 최소 인원 보장
     for d in range(num_days):
         model.Add(sum(shifts[(e, d, 0)] for e in range(num_staff)) >= min_d)
         model.Add(sum(shifts[(e, d, 1)] for e in range(num_staff)) >= min_e)
         model.Add(sum(shifts[(e, d, 2)] for e in range(num_staff)) >= min_n)
 
-    # --- 리더/보조리더 조건 (소프트 제약 및 목표 함수 설정) ---
-    
-    leader_indices = [i for i, s in enumerate(staff_data) if s['name'] in LEADER]
-    sub_leader_indices = [i for i, s in enumerate(staff_data) if s['name'] in SUB_LEADER]
-    
-    objective_terms = []
-    
-    # 1. 원티드(일반 글씨) 반영 보상 (가중치 10)
+    # 11. D, E, N 근무 횟수 비슷하게 (편차 최소화)
+    for s in [0, 1, 2]: # D, E, N
+        min_shift = model.NewIntVar(0, num_days, f'min_shift_{s}')
+        max_shift = model.NewIntVar(0, num_days, f'max_shift_{s}')
+        for e in range(num_staff):
+            shift_count = sum(shifts[(e, d, s)] for d in range(num_days))
+            model.Add(shift_count >= min_shift)
+            model.Add(shift_count <= max_shift)
+        
+        diff = model.NewIntVar(0, num_days, f'diff_{s}')
+        model.Add(diff == max_shift - min_shift)
+        objective_terms.append(-10 * diff) # 편차가 클수록 페널티
+
+    # 12. 원티드(일반 글씨) 반영 보상
     for e, staff in enumerate(staff_data):
         for d, wanted_shifts in staff['wanted'].items():
             for w_shift in wanted_shifts:
                 if w_shift in SHIFT_IDX:
-                    objective_terms.append(10 * shifts[(e, d, SHIFT_IDX[w_shift])])
+                    objective_terms.append(15 * shifts[(e, d, SHIFT_IDX[w_shift])])
                 elif w_shift in ['X', 'SX', 'H', 'HX', 'TR']:
-                    objective_terms.append(10 * shifts[(e, d, 3)])
-
-    # 2. 리더/보조리더 배치 로직
-    for d in range(num_days):
-        for s in [0, 1, 2]: # D, E, N
-            # 해당 근무에 리더가 1명 이상 있는지 나타내는 boolean 변수
-            has_leader = model.NewBoolVar(f'has_leader_d{d}_s{s}')
-            # 리더 합계가 1 이상이면 has_leader는 1
-            model.Add(sum(shifts[(e, d, s)] for e in leader_indices) >= 1).OnlyEnforceIf(has_leader)
-            model.Add(sum(shifts[(e, d, s)] for e in leader_indices) == 0).OnlyEnforceIf(has_leader.Not())
-            
-            # 해당 근무에 보조리더가 1명 이상 있는지 나타내는 boolean 변수
-            has_sub_leader = model.NewBoolVar(f'has_sub_leader_d{d}_s{s}')
-            model.Add(sum(shifts[(e, d, s)] for e in sub_leader_indices) >= 1).OnlyEnforceIf(has_sub_leader)
-            model.Add(sum(shifts[(e, d, s)] for e in sub_leader_indices) == 0).OnlyEnforceIf(has_sub_leader.Not())
-            
-            # 필수 조건: 리더나 보조리더 중 최소 1명은 있어야 함 (하드 제약)
-            model.AddBoolOr([has_leader, has_sub_leader])
-            
-            # 목표 함수: 리더가 배치되는 것을 강력히 선호 (가중치 100)
-            # 보조리더 배치는 허용하되 보상은 주지 않음 (또는 음수 페널티를 줄 수 있음)
-            objective_terms.append(100 * has_leader)
-            
-    # 모델의 목표: 보상(objective_terms)을 최대화
+                    objective_terms.append(15 * shifts[(e, d, 3)])
+    
+    # 모델 풀이
     model.Maximize(sum(objective_terms))
-
-    # 솔버 실행
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 60.0 # 복잡한 조건이므로 60초로 설정
+    solver.parameters.max_time_in_seconds = 60.0 # 탐색 시간 60초
     status = solver.Solve(model)
 
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
@@ -147,13 +161,13 @@ def process_excel(file_content, target_x_count, min_d, min_e, min_n):
     num_days = 0
     for col in range(1, ws.max_column + 1):
         val = ws.cell(row=1, column=col).value
-        if val and str(val).isdigit(): # 1, 2, 3... 등 날짜가 시작되는 열
+        if val and str(val).isdigit():
             if start_col is None:
                 start_col = col
             num_days += 1
             
     if start_col is None:
-        start_col = 2 # 기본값
+        start_col = 2
         num_days = 31
 
     staff_data = []
@@ -199,9 +213,9 @@ def process_excel(file_content, target_x_count, min_d, min_e, min_n):
         r = staff['row']
         for d in range(num_days):
             col = start_col + d
-            if d not in staff['fixed']: # 노란색 고정이 아니었던 곳만 새로 채움
+            if d not in staff['fixed']: 
                 val = staff['final_schedule'].get(d, '')
-                # 여자의 경우 추가된 오프 1개를 'HX'로 변환 (간단한 후처리)
+                # 여자의 경우 추가된 오프 1개를 'HX'로 변환
                 if val == 'X' and not staff['is_male'] and 'HX' not in staff['final_schedule'].values():
                     val = 'HX'
                 
@@ -217,14 +231,14 @@ def process_excel(file_content, target_x_count, min_d, min_e, min_n):
 st.set_page_config(page_title="스마트 듀티표 생성기", layout="wide")
 
 st.title("🏥 스마트 듀티표 자동 생성기")
-st.markdown("입력하신 **제약조건**과 **리더/보조리더** 규칙을 모두 반영한 최적화 모델입니다.")
+st.markdown("입력하신 **제약조건**과 **리더/보조리더** 규칙을 모두 반영한 인공지능 최적화 모델입니다.")
 
 with st.sidebar:
     st.header("⚙️ 기본 설정")
     target_x = st.number_input("이번 달 기본 오프(X) 개수", min_value=1, max_value=15, value=8)
     
     st.header("👥 일별 최소 필요 인원")
-    st.markdown("*(조건이 빡빡해서 에러가 날 경우 이 숫자를 조절해보세요)*")
+    st.markdown("*(조건이 빡빡해서 에러가 날 경우 이 숫자를 낮춰보세요)*")
     min_d = st.number_input("Day 최소 인원", min_value=1, max_value=10, value=3)
     min_e = st.number_input("Evening 최소 인원", min_value=1, max_value=10, value=3)
     min_n = st.number_input("Night 최소 인원", min_value=1, max_value=10, value=3)
