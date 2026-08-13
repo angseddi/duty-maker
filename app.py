@@ -27,7 +27,6 @@ def parse_shift_options(val_str):
     if not val_str or str(val_str).strip().upper() == "NONE":
         return []
     options = []
-    # 수정사항 2 반영: 쉼표로 구분된 여러 값을 모두 파싱
     for part in str(val_str).split(','):
         p = part.strip().upper()
         if 'D' in p and 'DE' not in p:
@@ -36,7 +35,8 @@ def parse_shift_options(val_str):
             options.append(1)
         elif 'N' in p:
             options.append(2)
-        elif 'X' in p or 'H' in p or 'TR' in p or 'SX' in p or 'O' in p:
+        # 수정사항 3, 4 반영: 기타(교육휴가) 및 XX 텍스트 대응 추가
+        elif 'X' in p or 'H' in p or 'TR' in p or 'SX' in p or 'O' in p or '기타' in p or '교육' in p:
             options.append(3)
         elif p == 'D':
             options.append(0)
@@ -59,7 +59,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
     # --- 제약 조건 (하드 및 소프트 제약) 적용 ---
     
     for e, staff in enumerate(staff_data):
-        # [A] 이전달 기록 고정 (수정사항 3 반영: 전달 말일과 월초 연결 완벽 연동)
+        # [A] 이전달 기록 고정
         for d in range(num_history):
             s_val = staff['history'][d]
             s_idx = SHIFT_IDX.get(s_val, 3)
@@ -69,7 +69,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         for d, opt_list in staff['fixed'].items():
             abs_d = num_history + d
             if opt_list:
-                # 수정사항 2 반영: 복수 선택지 중 반드시 딱 1개만 고르도록 강제
                 model.Add(sum(shifts[(e, abs_d, s)] for s in opt_list) == 1)
 
         # [C] 기본 규칙 (전체 기간에 대해 적용)
@@ -94,9 +93,16 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             # N 근무 후 최소 2일 오프 (N -> O -> 일 금지)
             model.Add(shifts[(e, d, 2)] + shifts[(e, d+1, 3)] + (1 - shifts[(e, d+2, 3)]) <= 2)
 
+        den_patterns = []
         for d in range(total_days - 2):
-            # 수정사항 1 반영: D -> E -> N 연속 근무 패턴 절대 금지
-            model.Add(shifts[(e, d, 0)] + shifts[(e, d+1, 1)] + shifts[(e, d+2, 2)] <= 2)
+            # 수정사항 1 반영: D -> E -> N 연속 근무 한달 1~2번으로 허용하되 가급적 자제 (페널티)
+            den_pattern = model.NewBoolVar(f'den_{e}_{d}')
+            model.AddBoolOr([shifts[(e, d, 0)].Not(), shifts[(e, d+1, 1)].Not(), shifts[(e, d+2, 2)].Not(), den_pattern])
+            objective_terms.append(-30 * den_pattern) 
+            den_patterns.append(den_pattern)
+            
+        # 한 사람당 D-E-N 패턴은 최대 2번까지만 허용
+        model.Add(sum(den_patterns) <= 2)
 
         for d in range(1, total_days - 1):
             # 독성 퐁당퐁당(Single X) 패턴 절대 금지: E-X-D, N-X-D, N-X-E
@@ -108,13 +114,20 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             single_x = model.NewBoolVar(f'single_x_{e}_{d}')
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-100 * single_x) 
+            
+            # 수정사항 2 반영: 비근무 사이 근무 하나만 껴있는 퐁당퐁당 근무(O-W-O) 최대한 자제 (-80점)
+            single_work = model.NewBoolVar(f'single_work_{e}_{d}')
+            # 휴무(d-1) + 근무(d) + 휴무(d+1) 인 경우에만 single_work가 1이 됨
+            model.Add(single_work >= shifts[(e, d-1, 3)] + (1 - shifts[(e, d, 3)]) + shifts[(e, d+1, 3)] - 2)
+            objective_terms.append(-80 * single_work)
 
         # [D] 당월 월간 목표 오프 카운트 산정
-        # 수정사항 4 반영: 원티드나 고정에 적힌 TR과 H는 X 카운트 목표에서 제외되도록 처리
+        # 수정사항 3, 4 반영: TR, H, 기타 등은 X 카운트 목표에서 제외되도록 보정
         fixed_h_tr_count = 0
         for raw_val in staff.get('fixed_raw', {}).values():
             opts = [p.strip().upper() for p in str(raw_val).split(',')]
-            if any(p in ['H', 'TR'] for p in opts):
+            # 'XX'는 포함 안되므로 순수 X로 취급, H/TR/기타 등만 개수 차감용으로 확인
+            if any(p in ['H', 'TR'] or '기타' in p or '교육' in p for p in opts):
                 fixed_h_tr_count += 1
                 
         target_offs = int(base_x_count) + fixed_h_tr_count
@@ -150,10 +163,12 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             if leader_and_sub_indices:
                 model.Add(sum(shifts[(e, abs_d, s)] for e in leader_and_sub_indices) >= 1)
             
-            # 소프트 제약: '찐' 리더가 들어가면 가산점 부여 (리더 우선 배치)
+            # 소프트 제약: 수정사항 5 반영 ('찐' 리더가 들어가면 아주 강력한 100점 가산점 부여)
             if leader_indices:
-                leader_count = sum(shifts[(e, abs_d, s)] for e in leader_indices)
-                objective_terms.append(25 * leader_count)
+                has_leader = model.NewBoolVar(f'has_leader_d{abs_d}_s{s}')
+                model.Add(sum(shifts[(e, abs_d, s)] for e in leader_indices) >= 1).OnlyEnforceIf(has_leader)
+                model.Add(sum(shifts[(e, abs_d, s)] for e in leader_indices) == 0).OnlyEnforceIf(has_leader.Not())
+                objective_terms.append(100 * has_leader)
 
         # 일별 D, E, N 인원 제한
         model.Add(sum(shifts[(e, abs_d, 0)] for e in range(num_staff)) >= int(min_d))
@@ -195,14 +210,13 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 for s in range(4):
                     if solver.Value(shifts[(e, num_history + d, s)]) == 1:
-                        staff['final_schedule'][d] = s # 에러 'E' 완벽 해결: 문자가 아닌 인덱스 숫자로 저장
+                        staff['final_schedule'][d] = REV_SHIFT_IDX[s]
         return True
     else:
         return False
 
 
 def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_n, max_n):
-    # data_only=True 추가: 엑셀 수식이 있을 경우 에러 방지
     wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
     ws = wb.active
 
@@ -286,14 +300,15 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             chosen_idx = staff['final_schedule'].get(d, 3)
             
             if is_fixed:
-                # 노란색 다중 옵션 중 AI가 고른 것과 일치하는 원본 텍스트 찾아 표시
                 raw_opts = [p.strip().upper() for p in str(staff['fixed_raw'].get(d, '')).split(',')]
-                val = REV_SHIFT_IDX[chosen_idx] # 기본
+                val = REV_SHIFT_IDX[chosen_idx]
                 for p in raw_opts:
                     if chosen_idx == 0 and 'D' in p: val = p
                     elif chosen_idx == 1 and 'E' in p: val = p
                     elif chosen_idx == 2 and 'N' in p: val = p
-                    elif chosen_idx == 3 and p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX']: val = p
+                    # 기타, XX 등도 알맞게 출력 (수정사항 3, 4 처리)
+                    elif chosen_idx == 3 and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): 
+                        val = p
             else:
                 val = REV_SHIFT_IDX[chosen_idx]
                 has_hx = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
@@ -305,23 +320,26 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             cell.value = val
             cell.alignment = center_align
                 
-            # 수정사항 4 반영: TR과 H 등을 독립적으로 정확히 집계
+            # 카운트 집계 (수정사항 3, 4 반영: TR, 기타, XX 등을 독립적으로 정확히 집계)
             raw_cell_val = str(val).strip().upper()
-            if raw_cell_val == 'D': counts['D'] += 1
-            elif raw_cell_val == 'E': counts['E'] += 1
-            elif raw_cell_val == 'N': counts['N'] += 1
-            elif raw_cell_val == 'H': counts['H'] += 1
-            elif raw_cell_val == 'HX': counts['HX'] += 1
-            elif raw_cell_val == 'SX': counts['SX'] += 1
-            elif raw_cell_val == 'TR': counts['I'] += 1 # TR은 I 통계로 처리
-            elif raw_cell_val in ['X', 'O', 'XX']: counts['X'] += 1
-            else: counts['X'] += 1
+            if raw_cell_val == 'D': counts['D'] = counts.get('D', 0) + 1
+            elif raw_cell_val == 'E': counts['E'] = counts.get('E', 0) + 1
+            elif raw_cell_val == 'N': counts['N'] = counts.get('N', 0) + 1
+            elif raw_cell_val == 'H': counts['H'] = counts.get('H', 0) + 1
+            elif raw_cell_val == 'HX': counts['HX'] = counts.get('HX', 0) + 1
+            elif raw_cell_val == 'SX': counts['SX'] = counts.get('SX', 0) + 1
+            elif 'TR' in raw_cell_val or '기타' in raw_cell_val or '교육' in raw_cell_val: 
+                counts['I'] = counts.get('I', 0) + 1 # TR/기타는 I 통계로 처리
+            elif raw_cell_val in ['X', 'O', 'XX']: 
+                counts['X'] = counts.get('X', 0) + 1 # XX는 X와 동일하게 집계
+            else: 
+                counts['X'] = counts.get('X', 0) + 1
                 
         for key, col in summary_cols.items():
             if key == '총합':
                 ws.cell(row=r, column=col).value = sum(counts.values())
             elif key in counts:
-                ws.cell(row=r, column=col).value = counts[key]
+                ws.cell(row=r, column=col).value = counts.get(key, 0)
             ws.cell(row=r, column=col).alignment = center_align
 
     output = io.BytesIO()
@@ -377,5 +395,4 @@ if uploaded_file is not None:
                 else:
                     st.error("🚨 제약 조건이 너무 빡빡하여 해답을 찾을 수 없습니다! 설정하신 최소/최대 인원을 조절하거나 원티드를 확인해주세요.")
             except Exception as e:
-                # 혹시라도 다른 오류가 나면 정확히 원인을 알려주도록 강화
                 st.error(f"오류가 발생했습니다. 엑셀 파일의 양식을 확인해주세요. (에러: {e})")
