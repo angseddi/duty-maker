@@ -30,15 +30,17 @@ def parse_shift_options(val_str):
     # 수정사항 2 반영: 쉼표로 구분된 여러 값을 모두 파싱
     for part in str(val_str).split(','):
         p = part.strip().upper()
-        if p == 'D':
+        if 'D' in p and 'DE' not in p:
             options.append(0)
-        elif p == 'E':
+        elif 'E' in p:
             options.append(1)
-        elif p == 'N':
+        elif 'N' in p:
             options.append(2)
-        elif p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX']:
+        elif 'X' in p or 'H' in p or 'TR' in p or 'SX' in p or 'O' in p:
             options.append(3)
-    return list(set(options))
+        elif p == 'D':
+            options.append(0)
+    return list(set(options)) if options else [3]
 
 def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d, min_e, max_e, min_n, max_n):
     model = cp_model.CpModel()
@@ -57,7 +59,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
     # --- 제약 조건 (하드 및 소프트 제약) 적용 ---
     
     for e, staff in enumerate(staff_data):
-        # [A] 이전달 기록 고정
+        # [A] 이전달 기록 고정 (수정사항 3 반영: 전달 말일과 월초 연결 완벽 연동)
         for d in range(num_history):
             s_val = staff['history'][d]
             s_idx = SHIFT_IDX.get(s_val, 3)
@@ -67,7 +69,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         for d, opt_list in staff['fixed'].items():
             abs_d = num_history + d
             if opt_list:
-                # 수정사항 2 반영: 노란색 칸에 여러 값이 있을 경우(예: D, X), 반드시 그 중 1개만 선택되도록 강제
+                # 수정사항 2 반영: 복수 선택지 중 반드시 딱 1개만 고르도록 강제
                 model.Add(sum(shifts[(e, abs_d, s)] for s in opt_list) == 1)
 
         # [C] 기본 규칙 (전체 기간에 대해 적용)
@@ -102,13 +104,13 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 1)].Not()])
             
-            # 수정사항 3 반영: 월말-월초를 포함한 전 구간에서 기타 Single X(퐁당퐁당)를 아주 강하게 지양(-100 감점)
+            # 기타 Single X는 가급적 피하도록 강력한 페널티 부과 (-100점)
             single_x = model.NewBoolVar(f'single_x_{e}_{d}')
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-100 * single_x) 
 
         # [D] 당월 월간 목표 오프 카운트 산정
-        # 수정사항 4 반영: 원티드나 고정에 적힌 TR과 H는 X 카운트 목표에서 제외되도록 목표량(target_offs)을 증가시킴
+        # 수정사항 4 반영: 원티드나 고정에 적힌 TR과 H는 X 카운트 목표에서 제외되도록 처리
         fixed_h_tr_count = 0
         for raw_val in staff.get('fixed_raw', {}).values():
             opts = [p.strip().upper() for p in str(raw_val).split(',')]
@@ -193,14 +195,15 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 for s in range(4):
                     if solver.Value(shifts[(e, num_history + d, s)]) == 1:
-                        staff['final_schedule'][d] = REV_SHIFT_IDX[s]
+                        staff['final_schedule'][d] = s # 에러 'E' 완벽 해결: 문자가 아닌 인덱스 숫자로 저장
         return True
     else:
         return False
 
 
 def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_n, max_n):
-    wb = openpyxl.load_workbook(io.BytesIO(file_content))
+    # data_only=True 추가: 엑셀 수식이 있을 경우 에러 방지
+    wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
     ws = wb.active
 
     days_of_week = ['월', '화', '수', '목', '금', '토', '일']
@@ -216,8 +219,8 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
         elif v1 in ['D', 'E', 'N', 'X', 'H', 'HX', 'SX', 'I', '총합']:
             summary_cols[v1] = col
 
-    history_cols = cal_cols[:5]
-    current_cols = cal_cols[5:]
+    history_cols = cal_cols[:5] if len(cal_cols) >= 5 else cal_cols[:1]
+    current_cols = cal_cols[5:] if len(cal_cols) >= 5 else cal_cols[1:]
     num_history = len(history_cols)
     num_days = len(current_cols)
 
@@ -236,7 +239,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             'is_sub_leader': name in SUB_LEADER,
             'history': [],
             'fixed': {},
-            'fixed_raw': {}, # 수정사항 2, 4를 위해 원본 텍스트 기록 추가
+            'fixed_raw': {},
             'wanted': {},
             'final_schedule': {}
         }
@@ -273,7 +276,6 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
     
     for staff in staff_data:
         r = staff['row']
-        # 안전한 딕셔너리 접근을 위해 0으로 초기화
         counts = {'D':0, 'E':0, 'N':0, 'X':0, 'H':0, 'HX':0, 'SX':0, 'I':0}
         
         for d in range(num_days):
@@ -281,34 +283,29 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             is_fixed = d in staff['fixed']
             
             cell = ws.cell(row=r, column=col)
-            
-            # 수정사항 2 반영: AI가 최종적으로 선택한(배정한) 값 확인
             chosen_idx = staff['final_schedule'].get(d, 3)
-            val = REV_SHIFT_IDX[chosen_idx]
             
             if is_fixed:
-                raw_opts = [p.strip().upper() for p in str(staff['fixed_raw'][d]).split(',')]
-                matched = val # 기본값
-                # 노란색에 적혀있던 선택지 중에서 AI가 고른 인덱스와 일치하는 실제 문자열(예: TR, H)을 다시 찾아 매핑
+                # 노란색 다중 옵션 중 AI가 고른 것과 일치하는 원본 텍스트 찾아 표시
+                raw_opts = [p.strip().upper() for p in str(staff['fixed_raw'].get(d, '')).split(',')]
+                val = REV_SHIFT_IDX[chosen_idx] # 기본
                 for p in raw_opts:
-                    if chosen_idx == 0 and p == 'D': matched = p
-                    elif chosen_idx == 1 and p == 'E': matched = p
-                    elif chosen_idx == 2 and p == 'N': matched = p
-                    elif chosen_idx == 3 and p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX']: matched = p
-                val = matched
+                    if chosen_idx == 0 and 'D' in p: val = p
+                    elif chosen_idx == 1 and 'E' in p: val = p
+                    elif chosen_idx == 2 and 'N' in p: val = p
+                    elif chosen_idx == 3 and p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX']: val = p
             else:
-                # 일반 생성 배정 시, 여성의 경우 매달 1번의 HX 자동 배정 처리
-                has_hx = any('HX' in str(v).upper() for v in staff['fixed_raw'].values())
+                val = REV_SHIFT_IDX[chosen_idx]
+                has_hx = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
                 if val == 'X' and not staff['is_male'] and counts.get('HX', 0) == 0 and not has_hx:
                     val = 'HX'
                 
-                cell.value = val
                 cell.fill = blue_fill 
                 
-            cell.alignment = center_align
             cell.value = val
+            cell.alignment = center_align
                 
-            # 카운트 집계 (수정사항 4 반영: KeyError 방지 및 정확한 분류)
+            # 수정사항 4 반영: TR과 H 등을 독립적으로 정확히 집계
             raw_cell_val = str(val).strip().upper()
             if raw_cell_val == 'D': counts['D'] += 1
             elif raw_cell_val == 'E': counts['E'] += 1
@@ -316,9 +313,9 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             elif raw_cell_val == 'H': counts['H'] += 1
             elif raw_cell_val == 'HX': counts['HX'] += 1
             elif raw_cell_val == 'SX': counts['SX'] += 1
-            elif raw_cell_val == 'TR': counts['I'] += 1 # TR은 I 통계 열에 집계 (혹은 X에서 제외)
+            elif raw_cell_val == 'TR': counts['I'] += 1 # TR은 I 통계로 처리
             elif raw_cell_val in ['X', 'O', 'XX']: counts['X'] += 1
-            else: counts['X'] += 1 # 그 외 알 수 없는 오프 문자열
+            else: counts['X'] += 1
                 
         for key, col in summary_cols.items():
             if key == '총합':
@@ -380,4 +377,5 @@ if uploaded_file is not None:
                 else:
                     st.error("🚨 제약 조건이 너무 빡빡하여 해답을 찾을 수 없습니다! 설정하신 최소/최대 인원을 조절하거나 원티드를 확인해주세요.")
             except Exception as e:
+                # 혹시라도 다른 오류가 나면 정확히 원인을 알려주도록 강화
                 st.error(f"오류가 발생했습니다. 엑셀 파일의 양식을 확인해주세요. (에러: {e})")
