@@ -114,6 +114,18 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             if opt_list:
                 model.Add(sum(shifts[(e, abs_d, s)] for s in opt_list) == 1)
 
+        # ★ [수정사항 1 반영] 원티드 오프(X) 전날 나이트(N) 철벽 방어 ★
+        for d in range(num_days):
+            abs_d = num_history + d
+            opts = staff['fixed'].get(d, [])
+            if not opts:
+                opts = staff['wanted'].get(d, [])
+            
+            # 노란색 고정이든 일반 원티드든 사용자가 X(3)가 포함된 값을 써냈고,
+            if 3 in opts: 
+                # AI가 그날을 실제로 오프(3)로 배정한다면, 전날(abs_d - 1)에는 절대 N(2)을 줄 수 없다.
+                model.AddImplication(shifts[(e, abs_d, 3)], shifts[(e, abs_d - 1, 2)].Not())
+
         # [C] 기본 규칙
         for d in range(total_days):
             model.AddExactlyOne(shifts[(e, d, s)] for s in range(4))
