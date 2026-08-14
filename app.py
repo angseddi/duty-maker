@@ -17,6 +17,7 @@ MEN = ["최충일", "윤진호", "이용재"]
 LEADER = ["용하영", "최충일", "박세은", "김소은", "윤지선", "이소희", "정하림", "최아라"]
 SUB_LEADER = ["김민지", "박우영", "오지은"]
 
+# 보건휴가 설정 저장 파일
 HX_SETTINGS_FILE = "hx_settings.json"
 
 def load_hx_settings():
@@ -122,14 +123,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.AddImplication(shifts[(e, d, 1)], shifts[(e, d+1, 0)].Not())
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 0)].Not())
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 1)].Not())
-            
-            # 근무 간 전환(D->E, E->N) 자체에 약한 페널티 부여
-            for s1 in [0, 1, 2]:
-                for s2 in [0, 1, 2]:
-                    if s1 != s2:
-                        trans = model.NewBoolVar(f'trans_{e}_{d}_{s1}_{s2}')
-                        model.Add(trans >= shifts[(e, d, s1)] + shifts[(e, d+1, s2)] - 1)
-                        objective_terms.append(-15 * trans)
 
         for d in range(total_days - 5):
             # 최대 5일 연속 근무 허용
@@ -145,7 +138,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
         den_patterns = []
         for d in range(total_days - 2):
-            # D -> E -> N 연속 근무 한달 1~2번으로 허용 (페널티)
+            # 3일 연속 D -> E -> N 패턴은 페널티 부여(-40점) (다른 감점들과 합쳐져서 사실상 차단됨)
             den_pattern = model.NewBoolVar(f'den_{e}_{d}')
             model.AddBoolOr([shifts[(e, d, 0)].Not(), shifts[(e, d+1, 1)].Not(), shifts[(e, d+2, 2)].Not(), den_pattern])
             objective_terms.append(-40 * den_pattern) 
@@ -154,59 +147,59 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         model.Add(sum(den_patterns) <= 2)
         
         for d in range(total_days - 4):
-            # 5일 연속 동일 근무 자제 (-80점 페널티)
+            # 5일 연속 동일 근무(DDDDD, EEEEE) 최대한 자제
             for s in [0, 1]:  
                 five_same = model.NewBoolVar(f'five_same_e{e}_d{d}_s{s}')
                 model.AddMinEquality(five_same, [shifts[(e, d+i, s)] for i in range(5)])
                 objective_terms.append(-80 * five_same)
 
         for d in range(1, total_days - 1):
-            # 독성 퐁당퐁당(Single X) 패턴 절대 금지
+            # 독성 퐁당퐁당(Single X) 패턴 절대 금지: E-X-D, N-X-D, N-X-E
             model.AddBoolOr([shifts[(e, d-1, 1)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 1)].Not()])
             
-            # 기타 Single X 자제 (-50점)
+            # 기타 Single X (가벼운 퐁당퐁당) 자제 (-50점) -> D-X-N은 허용하지만 살짝 자제하는 정도
             single_x = model.NewBoolVar(f'single_x_{e}_{d}')
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-50 * single_x) 
             
-            # 비근무 사이 근무 하나 껴있는 퐁당퐁당 근무 자제 (-80점)
+            # 비근무 사이 근무 하나만 껴있는 퐁당퐁당 근무(O-W-O) 최대한 자제 (-80점)
             single_work = model.NewBoolVar(f'single_work_{e}_{d}')
             model.Add(single_work >= shifts[(e, d-1, 3)] + (1 - shifts[(e, d, 3)]) + shifts[(e, d+1, 3)] - 2)
             objective_terms.append(-80 * single_work)
             
-            # 특정 근무가 하나만 달랑 있는 경우 자제
+            # [핵심 튜닝] D나 E가 하나만 있는 경우 (D-E-E-E, D-D-E 등) -> 약한 감점(-10점)으로 융통성 부여
             for s in [0, 1]: 
                 single_shift = model.NewBoolVar(f'single_shift_e{e}_d{d}_s{s}')
                 model.Add(single_shift >= shifts[(e, d, s)] + (1 - shifts[(e, d-1, s)]) + (1 - shifts[(e, d+1, s)]) - 2)
                 objective_terms.append(-10 * single_shift)
 
-            # N 하나로 끝나는 극악 패턴 초강력 감점(-100점)
+            # [핵심 튜닝] 인터벌 마지막에 N 하나로 끝나는 극악 패턴(D-D-N-O, E-E-N-O) -> 초강력 감점(-100점)
             single_n_end = model.NewBoolVar(f'single_n_end_e{e}_d{d}')
             worked_d_e_before = model.NewBoolVar(f'worked_d_e_before_e{e}_d{d}')
+            # 전날에 D 또는 E를 했는가?
             model.Add(worked_d_e_before == shifts[(e, d-1, 0)] + shifts[(e, d-1, 1)])
+            # (전날 D/E) -> (오늘 N) -> (내일 O)
             model.Add(single_n_end >= shifts[(e, d, 2)] + shifts[(e, d+1, 3)] + worked_d_e_before - 2)
             objective_terms.append(-100 * single_n_end)
 
-        # [D] 당월 월간 목표 오프 카운트 산정
+        # [D] 당월 오프 카운트 통일
         fixed_h_tr_count = 0
-        has_hx_fixed = False
         for raw_val in staff.get('fixed_raw', {}).values():
             opts = [p.strip().upper() for p in str(raw_val).split(',')]
             if any(p in ['H', 'TR'] or '기타' in p or '교육' in p for p in opts):
                 fixed_h_tr_count += 1
-            if any('HX' in p for p in opts):
-                has_hx_fixed = True
                 
         target_offs = int(base_x_count) + fixed_h_tr_count
         if not staff['is_male']:
             target_offs += 1
 
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
-        model.Add(off_count == target_offs)
-
-        # ★ 새로운 마법: 지정된 기간에 HX(오프)가 무조건 1개 이상 존재하도록 AI에 강제 (하드 제약) ★
+        model.Add(off_count == target_offs) # 모든 사람 X 개수 완벽 통일
+        
+        # ★ 새로 추가된 보건휴가 시기 강제 배정 (하드 제약) ★
+        has_hx_fixed = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
         if not staff['is_male'] and not has_hx_fixed:
             target_hx_period = []
             if name in custom_rules.get('hx_1_5', []): target_hx_period = range(0, min(5, num_days))
@@ -247,6 +240,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 model.Add(shifts[(e, num_history + d, 2)] == 0)
 
+
     # [E] 전역 제약 조건 (리더 및 인원수)
     leader_and_sub_indices = [i for i, s in enumerate(staff_data) if s['is_leader'] or s['is_sub_leader']]
     leader_indices = [i for i, s in enumerate(staff_data) if s['is_leader']]
@@ -270,7 +264,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         model.Add(sum(shifts[(e, abs_d, 2)] for e in range(num_staff)) >= int(min_n))
         model.Add(sum(shifts[(e, abs_d, 2)] for e in range(num_staff)) <= int(max_n))
 
-    # N(나이트) 개수 균등 분배
+    # N(나이트) 개수 균등 분배 
     n_balance_counts = []
     for e, staff in enumerate(staff_data):
         n_count = model.NewIntVar(0, num_days, f'n_count_{e}')
@@ -286,7 +280,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         model.AddMinEquality(min_n_count, n_balance_counts)
         model.Add(max_n_count - min_n_count <= 1)
 
-    # [F] 원티드 반영
+    # [F] 원티드 반영 (가산점)
     for e, staff in enumerate(staff_data):
         for d, opt_list in staff['wanted'].items():
             abs_d = num_history + d
@@ -303,6 +297,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 for s in range(4):
                     if solver.Value(shifts[(e, num_history + d, s)]) == 1:
+                        # 무조건 인덱스 번호(s)를 저장하여 'E' 에러를 완벽 차단
                         staff['final_schedule'][d] = s
         return True
     else:
@@ -392,11 +387,10 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
         counts = {'D':0, 'E':0, 'N':0, 'X':0, 'H':0, 'HX':0, 'SX':0, 'I':0}
         name = staff['name']
         
-        # --- HX 시기 고정 로직 (Pre-calculation) ---
+        # --- HX 시기 고정 로직 (지정된 범위에서 가장 먼저 나오는 오프를 찾음) ---
         hx_target_d = -1
         has_hx_fixed = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
         if not staff['is_male'] and not has_hx_fixed:
-            # AI가 배정한 전체 오프(X)와 사용자가 원티드/고정으로 적어둔 순수 오프(X)를 모두 후보군으로 확보
             all_x_days = [d for d in range(num_days) if staff['final_schedule'].get(d, 3) == 3]
             valid_hx_days = []
             for d in all_x_days:
@@ -417,7 +411,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             
             if preferred:
                 hx_target_d = preferred[0]
-            elif valid_hx_days:
+            elif valid_hx_days: # 지정 범위가 없거나 못 찾았을 경우 대비책
                 hx_target_d = valid_hx_days[0]
         # ---------------------------------------------
         
@@ -437,11 +431,12 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                     elif chosen_idx == 2 and 'N' in p: val = p; break
                     elif chosen_idx == 3 and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): val = p; break
                 
-                # 타겟 날짜라면 묻고 따지지도 않고 HX로 변환
+                # 타겟 날짜라면 HX로 덮어쓰기
                 if d == hx_target_d:
                     val = 'HX'
             else:
                 val = REV_SHIFT_IDX[chosen_idx]
+                # 타겟 날짜라면 HX로 덮어쓰기
                 if d == hx_target_d:
                     val = 'HX'
                 
@@ -504,6 +499,7 @@ with st.sidebar:
 if uploaded_file is not None:
     st.success("✅ 파일 업로드 완료! 데이터를 분석합니다.")
     
+    # 엑셀 파일에서 이름 목록을 바로 뽑아서 선택지로 활용
     staff_names = get_staff_names(uploaded_file.getvalue())
     female_staff_names = [name for name in staff_names if name not in MEN]
     
