@@ -59,7 +59,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
     
     # 변수 생성
     shifts = {}
-    is_working = {} # 근무(D,E,N) 여부를 나타내는 통합 변수
+    is_working = {} 
     for e in range(num_staff):
         for d in range(total_days):
             for s in range(4): # 0:D, 1:E, 2:N, 3:O
@@ -96,14 +96,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.AddImplication(shifts[(e, d, 1)], shifts[(e, d+1, 0)].Not())
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 0)].Not())
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 1)].Not())
-            
-            # 근무 간 전환(D->E, E->N) 페널티 부여 (-15점)
-            for s1 in [0, 1, 2]:
-                for s2 in [0, 1, 2]:
-                    if s1 != s2:
-                        trans = model.NewBoolVar(f'trans_{e}_{d}_{s1}_{s2}')
-                        model.Add(trans >= shifts[(e, d, s1)] + shifts[(e, d+1, s2)] - 1)
-                        objective_terms.append(-15 * trans)
 
         for d in range(total_days - 5):
             # 최대 5일 연속 근무 허용
@@ -119,10 +111,10 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
         den_patterns = []
         for d in range(total_days - 2):
-            # D -> E -> N 연속 근무 한달 1~2번 허용 (페널티)
+            # 3일 연속 D -> E -> N 패턴은 페널티 부여(-40점) (다른 감점들과 합쳐져서 사실상 차단됨)
             den_pattern = model.NewBoolVar(f'den_{e}_{d}')
             model.AddBoolOr([shifts[(e, d, 0)].Not(), shifts[(e, d+1, 1)].Not(), shifts[(e, d+2, 2)].Not(), den_pattern])
-            objective_terms.append(-30 * den_pattern) 
+            objective_terms.append(-40 * den_pattern) 
             den_patterns.append(den_pattern)
             
         model.Add(sum(den_patterns) <= 2)
@@ -135,29 +127,37 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
                 objective_terms.append(-80 * five_same)
 
         for d in range(1, total_days - 1):
-            # E-X-D, N-X-D, N-X-E 절대 금지
+            # 독성 퐁당퐁당(Single X) 패턴 절대 금지: E-X-D, N-X-D, N-X-E
             model.AddBoolOr([shifts[(e, d-1, 1)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 1)].Not()])
             
-            # 기타 Single X 자제 (-50점)
+            # 기타 Single X (가벼운 퐁당퐁당) 자제 (-50점) -> D-X-N은 허용하지만 살짝 자제하는 정도
             single_x = model.NewBoolVar(f'single_x_{e}_{d}')
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-50 * single_x) 
             
-            # 비근무 사이 근무 하나만 껴있는 패턴 자제 (-80점)
+            # 비근무 사이 근무 하나만 껴있는 퐁당퐁당 근무(O-W-O) 최대한 자제 (-80점)
             single_work = model.NewBoolVar(f'single_work_{e}_{d}')
             model.Add(single_work >= shifts[(e, d-1, 3)] + (1 - shifts[(e, d, 3)]) + shifts[(e, d+1, 3)] - 2)
             objective_terms.append(-80 * single_work)
             
-            # 하나만 달랑 있는 근무 자제
-            for s in [0, 1, 2]: 
+            # [핵심 튜닝] D나 E가 하나만 있는 경우 (D-E-E-E, D-D-E 등) -> 약한 감점(-10점)으로 융통성 부여
+            for s in [0, 1]: 
                 single_shift = model.NewBoolVar(f'single_shift_e{e}_d{d}_s{s}')
                 model.Add(single_shift >= shifts[(e, d, s)] + (1 - shifts[(e, d-1, s)]) + (1 - shifts[(e, d+1, s)]) - 2)
-                penalty = -80 if s == 2 else -30
-                objective_terms.append(penalty * single_shift)
+                objective_terms.append(-10 * single_shift)
 
-        # [D] 당월 오프 카운트 (H, TR 등 제외) 및 강제 일치
+            # [핵심 튜닝] 인터벌 마지막에 N 하나로 끝나는 극악 패턴(D-D-N-O, E-E-N-O) -> 초강력 감점(-100점)
+            single_n_end = model.NewBoolVar(f'single_n_end_e{e}_d{d}')
+            worked_d_e_before = model.NewBoolVar(f'worked_d_e_before_e{e}_d{d}')
+            # 전날에 D 또는 E를 했는가?
+            model.Add(worked_d_e_before == shifts[(e, d-1, 0)] + shifts[(e, d-1, 1)])
+            # (전날 D/E) -> (오늘 N) -> (내일 O)
+            model.Add(single_n_end >= shifts[(e, d, 2)] + shifts[(e, d+1, 3)] + worked_d_e_before - 2)
+            objective_terms.append(-100 * single_n_end)
+
+        # [D] 당월 오프 카운트 통일
         fixed_h_tr_count = 0
         for raw_val in staff.get('fixed_raw', {}).values():
             opts = [p.strip().upper() for p in str(raw_val).split(',')]
@@ -169,7 +169,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             target_offs += 1
 
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
-        model.Add(off_count == target_offs) # X 개수 완벽 통일
+        model.Add(off_count == target_offs) # 모든 사람 X 개수 완벽 통일
 
         # D와 E 갯수 비슷하게 맞추기
         d_count = sum(shifts[(e, num_history + d, 0)] for d in range(num_days))
@@ -179,26 +179,22 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         model.Add(de_diff >= e_count - d_count)
         objective_terms.append(-5 * de_diff)
 
-        # ★ [추가] 맞춤 조건 (특이사항) 적용 ★
+        # [특이사항 맞춤조건]
         if name in custom_rules.get('weekend_off', []):
-            # 주말 오프 위주: 주말에 일하면 페널티
             for d in weekend_indices:
                 objective_terms.append(-60 * is_working[(e, num_history + d)])
                 
         if name in custom_rules.get('weekend_work', []):
-            # 주말 근무 위주: 주말에 일하면 가산점
             for d in weekend_indices:
                 objective_terms.append(60 * is_working[(e, num_history + d)])
                 
         if name in custom_rules.get('five_days', []):
-            # 5일 연속 근무 위주: 5일 연속 일하면 가산점
             for d in range(total_days - 4):
                 five_work = model.NewBoolVar(f'five_work_e{e}_d{d}')
                 model.AddMinEquality(five_work, [is_working[(e, d+i)] for i in range(5)])
                 objective_terms.append(60 * five_work)
                 
         if name in custom_rules.get('no_night', []):
-            # 나이트 전면 배제: 해당 인원은 나이트 무조건 0번
             for d in range(num_days):
                 model.Add(shifts[(e, num_history + d, 2)] == 0)
 
@@ -226,7 +222,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         model.Add(sum(shifts[(e, abs_d, 2)] for e in range(num_staff)) >= int(min_n))
         model.Add(sum(shifts[(e, abs_d, 2)] for e in range(num_staff)) <= int(max_n))
 
-    # N(나이트) 개수 균등 분배 (단, 나이트 전면 배제 인원은 이 균등 분배 룰에서 열외시킴)
+    # N(나이트) 개수 균등 분배 
     n_balance_counts = []
     for e, staff in enumerate(staff_data):
         n_count = model.NewIntVar(0, num_days, f'n_count_{e}')
@@ -259,6 +255,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 for s in range(4):
                     if solver.Value(shifts[(e, num_history + d, s)]) == 1:
+                        # 무조건 인덱스 번호(s)를 저장하여 'E' 에러를 완벽 차단
                         staff['final_schedule'][d] = s
         return True
     else:
@@ -272,7 +269,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
     days_of_week = ['월', '화', '수', '목', '금', '토', '일']
     cal_cols = []
     summary_cols = {}
-    weekend_indices = [] # 주말 날짜 인덱스 저장
+    weekend_indices = []
     
     for col in range(2, ws.max_column + 1):
         v1 = str(ws.cell(row=1, column=col).value).strip().upper() if ws.cell(row=1, column=col).value is not None else ""
@@ -288,7 +285,6 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
     num_history = len(history_cols)
     num_days = len(current_cols)
     
-    # 주말(토,일) 인덱스 뽑기 (맞춤조건 반영용)
     for d, col in enumerate(current_cols):
         day_str = str(ws.cell(row=2, column=col).value).strip()
         if day_str in ['토', '일']:
