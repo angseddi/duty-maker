@@ -35,6 +35,7 @@ def parse_shift_options(val_str):
             options.append(1)
         elif 'N' in p:
             options.append(2)
+        # 수정사항: 기타(교육휴가) 및 XX 텍스트 대응 추가
         elif 'X' in p or 'H' in p or 'TR' in p or 'SX' in p or 'O' in p or '기타' in p or '교육' in p:
             options.append(3)
         elif p == 'D':
@@ -79,6 +80,15 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.AddImplication(shifts[(e, d, 1)], shifts[(e, d+1, 0)].Not())
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 0)].Not())
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 1)].Not())
+            
+            # 수정사항 3 반영: 근무 간 전환(D->E, E->N) 자체에 약한 페널티 부여하여 
+            # 한 인터벌 내에 D,E,N이 모두 섞이는 것(예: D-D-E-N-N)을 가급적 자제 (-15점)
+            for s1 in [0, 1, 2]:
+                for s2 in [0, 1, 2]:
+                    if s1 != s2:
+                        trans = model.NewBoolVar(f'trans_{e}_{d}_{s1}_{s2}')
+                        model.Add(trans >= shifts[(e, d, s1)] + shifts[(e, d+1, s2)] - 1)
+                        objective_terms.append(-15 * trans)
 
         for d in range(total_days - 5):
             # 최대 5일 연속 근무 허용 (6일 중 최소 1일은 휴무)
@@ -103,33 +113,44 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         # 한 사람당 D-E-N 패턴은 최대 2번까지만 허용
         model.Add(sum(den_patterns) <= 2)
         
-        # ★ 새로운 수정사항: 5일 연속 동일 근무(DDDDD, EEEEE) 최대한 자제 (-80점 페널티)
         for d in range(total_days - 4):
-            for s in [0, 1]:  # D(0)와 E(1)에 대해서만 적용 (N은 이미 하드제약으로 3일까지 제한됨)
+            # 5일 연속 동일 근무(DDDDD, EEEEE) 최대한 자제 (-80점 페널티)
+            for s in [0, 1]:  
                 five_same = model.NewBoolVar(f'five_same_e{e}_d{d}_s{s}')
                 model.AddMinEquality(five_same, [shifts[(e, d+i, s)] for i in range(5)])
                 objective_terms.append(-80 * five_same)
 
         for d in range(1, total_days - 1):
             # 독성 퐁당퐁당(Single X) 패턴 절대 금지: E-X-D, N-X-D, N-X-E
+            # 수정사항 1 반영: D-X-N 은 이곳에서 금지하지 않고 자연스럽게 허용
             model.AddBoolOr([shifts[(e, d-1, 1)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 1)].Not()])
             
-            # 기타 Single X는 가급적 피하도록 강력한 페널티 부과 (-100점)
+            # 기타 Single X는 가급적 피하도록 페널티 부과 (-50점) (D-X-N도 여기에 해당되어 가끔만 발생)
             single_x = model.NewBoolVar(f'single_x_{e}_{d}')
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
-            objective_terms.append(-100 * single_x) 
+            objective_terms.append(-50 * single_x) 
             
             # 비근무 사이 근무 하나만 껴있는 퐁당퐁당 근무(O-W-O) 최대한 자제 (-80점)
             single_work = model.NewBoolVar(f'single_work_{e}_{d}')
             model.Add(single_work >= shifts[(e, d-1, 3)] + (1 - shifts[(e, d, 3)]) + shifts[(e, d+1, 3)] - 2)
             objective_terms.append(-80 * single_work)
+            
+            # 수정사항 2 반영: 앞뒤로 다른 근무/오프가 있어 특정 근무가 하나만 달랑 있는 경우 자제
+            for s in [0, 1, 2]: # D, E, N
+                single_shift = model.NewBoolVar(f'single_shift_e{e}_d{d}_s{s}')
+                model.Add(single_shift >= shifts[(e, d, s)] + (1 - shifts[(e, d-1, s)]) + (1 - shifts[(e, d+1, s)]) - 2)
+                
+                # N 하나만 있는 건 정말정말 자제(-80점), D나 E 하나만 있는 건 조금 자제(-30점)
+                penalty = -80 if s == 2 else -30
+                objective_terms.append(penalty * single_shift)
 
         # [D] 당월 월간 목표 오프 카운트 산정
         fixed_h_tr_count = 0
         for raw_val in staff.get('fixed_raw', {}).values():
             opts = [p.strip().upper() for p in str(raw_val).split(',')]
+            # 'XX'는 순수 X로 취급, H/TR/기타 등만 개수 차감용으로 확인
             if any(p in ['H', 'TR'] or '기타' in p or '교육' in p for p in opts):
                 fixed_h_tr_count += 1
                 
@@ -161,7 +182,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             if leader_and_sub_indices:
                 model.Add(sum(shifts[(e, abs_d, s)] for e in leader_and_sub_indices) >= 1)
             
-            # 소프트 제약: '찐' 리더가 들어가면 아주 강력한 100점 가산점 부여
+            # 소프트 제약: '찐' 리더가 들어가면 아주 강력한 가산점 부여
             if leader_indices:
                 has_leader = model.NewBoolVar(f'has_leader_d{abs_d}_s{s}')
                 model.Add(sum(shifts[(e, abs_d, s)] for e in leader_indices) >= 1).OnlyEnforceIf(has_leader)
@@ -208,7 +229,8 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 for s in range(4):
                     if solver.Value(shifts[(e, num_history + d, s)]) == 1:
-                        staff['final_schedule'][d] = REV_SHIFT_IDX[s]
+                        # 에러 E 완벽 해결: 문자가 아니라 인덱스 숫자(s)만 정확히 저장합니다!
+                        staff['final_schedule'][d] = s
         return True
     else:
         return False
@@ -296,8 +318,9 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             
             cell = ws.cell(row=r, column=col)
             
-            # AI가 배정한 값
-            val = staff['final_schedule'].get(d, 'X')
+            # AI가 배정한 값 (숫자 0,1,2,3 중 하나)을 문자로 안전하게 변환
+            chosen_idx = staff['final_schedule'].get(d, 3)
+            val = REV_SHIFT_IDX.get(chosen_idx, 'X')
             
             if is_fixed:
                 raw_opts = [p.strip().upper() for p in str(staff['fixed_raw'].get(d, '')).split(',')]
