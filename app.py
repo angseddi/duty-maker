@@ -114,17 +114,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             if opt_list:
                 model.Add(sum(shifts[(e, abs_d, s)] for s in opt_list) == 1)
 
-        # ★ [수정사항 1] 원티드나 고정에 X가 포함되어 있고 실제로 그 날 X가 배정된다면, 전날 N 절대 불가 ★
-        for d in range(num_days):
-            abs_d = num_history + d
-            opts = staff['fixed'].get(d, [])
-            if not opts:
-                opts = staff['wanted'].get(d, [])
-            
-            if 3 in opts: # 원티드나 고정에 오프(3)가 포함된 경우
-                # 만약 해당 날짜(abs_d)에 오프(3)가 배정된다면, 전날(abs_d-1)에는 나이트(2)를 배정할 수 없다.
-                model.AddImplication(shifts[(e, abs_d, 3)], shifts[(e, abs_d - 1, 2)].Not())
-
         # [C] 기본 규칙
         for d in range(total_days):
             model.AddExactlyOne(shifts[(e, d, s)] for s in range(4))
@@ -149,7 +138,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
         den_patterns = []
         for d in range(total_days - 2):
-            # 3일 연속 D -> E -> N 패턴은 페널티 부여(-40점)
+            # 3일 연속 D -> E -> N 패턴은 페널티 부여(-40점) (다른 감점들과 합쳐져서 사실상 차단됨)
             den_pattern = model.NewBoolVar(f'den_{e}_{d}')
             model.AddBoolOr([shifts[(e, d, 0)].Not(), shifts[(e, d+1, 1)].Not(), shifts[(e, d+2, 2)].Not(), den_pattern])
             objective_terms.append(-40 * den_pattern) 
@@ -170,26 +159,28 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 0)].Not()])
             model.AddBoolOr([shifts[(e, d-1, 2)].Not(), shifts[(e, d, 3)].Not(), shifts[(e, d+1, 1)].Not()])
             
-            # 기타 Single X 자제 (-50점)
+            # 기타 Single X (가벼운 퐁당퐁당) 자제 (-50점) -> D-X-N은 허용하지만 살짝 자제하는 정도
             single_x = model.NewBoolVar(f'single_x_{e}_{d}')
             model.Add(single_x >= (1 - shifts[(e, d-1, 3)]) + shifts[(e, d, 3)] + (1 - shifts[(e, d+1, 3)]) - 2)
             objective_terms.append(-50 * single_x) 
             
-            # 비근무 사이 근무 하나만 껴있는 퐁당퐁당 근무 자제 (-80점)
+            # 비근무 사이 근무 하나만 껴있는 퐁당퐁당 근무(O-W-O) 최대한 자제 (-80점)
             single_work = model.NewBoolVar(f'single_work_{e}_{d}')
             model.Add(single_work >= shifts[(e, d-1, 3)] + (1 - shifts[(e, d, 3)]) + shifts[(e, d+1, 3)] - 2)
             objective_terms.append(-80 * single_work)
             
-            # D나 E가 하나만 있는 경우 약한 감점(-10점)으로 융통성 부여
+            # [핵심 튜닝] D나 E가 하나만 있는 경우 (D-E-E-E, D-D-E 등) -> 약한 감점(-10점)으로 융통성 부여
             for s in [0, 1]: 
                 single_shift = model.NewBoolVar(f'single_shift_e{e}_d{d}_s{s}')
                 model.Add(single_shift >= shifts[(e, d, s)] + (1 - shifts[(e, d-1, s)]) + (1 - shifts[(e, d+1, s)]) - 2)
                 objective_terms.append(-10 * single_shift)
 
-            # 인터벌 마지막에 N 하나로 끝나는 극악 패턴(D-D-N-O, E-E-N-O) 초강력 감점(-100점)
+            # [핵심 튜닝] 인터벌 마지막에 N 하나로 끝나는 극악 패턴(D-D-N-O, E-E-N-O) -> 초강력 감점(-100점)
             single_n_end = model.NewBoolVar(f'single_n_end_e{e}_d{d}')
             worked_d_e_before = model.NewBoolVar(f'worked_d_e_before_e{e}_d{d}')
+            # 전날에 D 또는 E를 했는가?
             model.Add(worked_d_e_before == shifts[(e, d-1, 0)] + shifts[(e, d-1, 1)])
+            # (전날 D/E) -> (오늘 N) -> (내일 O)
             model.Add(single_n_end >= shifts[(e, d, 2)] + shifts[(e, d+1, 3)] + worked_d_e_before - 2)
             objective_terms.append(-100 * single_n_end)
 
@@ -205,9 +196,9 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             target_offs += 1
 
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
-        model.Add(off_count == target_offs) 
+        model.Add(off_count == target_offs) # 모든 사람 X 개수 완벽 통일
         
-        # 보건휴가 시기 강제 배정
+        # ★ 새로 추가된 보건휴가 시기 강제 배정 (하드 제약) ★
         has_hx_fixed = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
         if not staff['is_male'] and not has_hx_fixed:
             target_hx_period = []
@@ -219,6 +210,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             elif name in custom_rules.get('hx_26_end', []): target_hx_period = range(25, num_days)
             
             if target_hx_period:
+                # 선택된 날짜 구간 내에 무조건 최소 1개 이상의 휴무(O)를 배정해라!
                 model.Add(sum(shifts[(e, num_history + d, 3)] for d in target_hx_period) >= 1)
 
         # D와 E 갯수 비슷하게 맞추기
@@ -248,6 +240,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             for d in range(num_days):
                 model.Add(shifts[(e, num_history + d, 2)] == 0)
 
+
     # [E] 전역 제약 조건 (리더 및 인원수)
     leader_and_sub_indices = [i for i, s in enumerate(staff_data) if s['is_leader'] or s['is_sub_leader']]
     leader_indices = [i for i, s in enumerate(staff_data) if s['is_leader']]
@@ -270,15 +263,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         model.Add(sum(shifts[(e, abs_d, 1)] for e in range(num_staff)) <= int(max_e))
         model.Add(sum(shifts[(e, abs_d, 2)] for e in range(num_staff)) >= int(min_n))
         model.Add(sum(shifts[(e, abs_d, 2)] for e in range(num_staff)) <= int(max_n))
-
-    # ★ [수정사항 3] 근무 겹침 방지 조합 ★
-    for group in custom_rules.get('not_together', []):
-        if len(group) >= 2:
-            group_indices = [i for i, s in enumerate(staff_data) if s['name'] in group]
-            for d in range(num_days):
-                abs_d = num_history + d
-                for s in [0, 1, 2]: # D, E, N 에 대해서만 (같은 날 같은 근무 절대 금지)
-                    model.Add(sum(shifts[(e, abs_d, s)] for e in group_indices) <= 1)
 
     # N(나이트) 개수 균등 분배 
     n_balance_counts = []
@@ -318,6 +302,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         return True
     else:
         return False
+
 
 def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_n, max_n, custom_rules):
     wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
@@ -426,7 +411,7 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
             
             if preferred:
                 hx_target_d = preferred[0]
-            elif valid_hx_days: 
+            elif valid_hx_days: # 지정 범위가 없거나 못 찾았을 경우 대비책
                 hx_target_d = valid_hx_days[0]
         # ---------------------------------------------
         
@@ -446,10 +431,12 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                     elif chosen_idx == 2 and 'N' in p: val = p; break
                     elif chosen_idx == 3 and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): val = p; break
                 
+                # 타겟 날짜라면 HX로 덮어쓰기
                 if d == hx_target_d:
                     val = 'HX'
             else:
                 val = REV_SHIFT_IDX[chosen_idx]
+                # 타겟 날짜라면 HX로 덮어쓰기
                 if d == hx_target_d:
                     val = 'HX'
                 
@@ -512,6 +499,7 @@ with st.sidebar:
 if uploaded_file is not None:
     st.success("✅ 파일 업로드 완료! 데이터를 분석합니다.")
     
+    # 엑셀 파일에서 이름 목록을 바로 뽑아서 선택지로 활용
     staff_names = get_staff_names(uploaded_file.getvalue())
     female_staff_names = [name for name in staff_names if name not in MEN]
     
@@ -528,21 +516,10 @@ if uploaded_file is not None:
         rule_weekend_work = st.multiselect("💪 주말(토,일) 근무 위주로 짤 사람", options=staff_names)
         
     st.markdown("---")
-    st.subheader("🚫 근무 겹침 방지 조합")
-    st.markdown("같은 날 같은 근무(D, E, N)에 동시에 들어갈 수 없는 직원을 묶어주세요. (최대 3팀)")
-    
-    col_n1, col_n2, col_n3 = st.columns(3)
-    with col_n1:
-        rule_not_1 = st.multiselect("겹침 방지 1팀", options=staff_names)
-    with col_n2:
-        rule_not_2 = st.multiselect("겹침 방지 2팀", options=staff_names)
-    with col_n3:
-        rule_not_3 = st.multiselect("겹침 방지 3팀", options=staff_names)
-
-    st.markdown("---")
     st.subheader("🌸 보건휴가(HX) 시기 지정")
     st.markdown("1일-5일, 6일-10일, 11일-15일, 16일-20일, 21일-25일, 26일-말일 중 지정할 수 있습니다.")
     
+    # 이전에 저장해둔 HX 설정 불러오기
     hx_settings = load_hx_settings()
     default_hx_1_5 = [n for n in hx_settings.get("hx_1_5", []) if n in female_staff_names]
     default_hx_6_10 = [n for n in hx_settings.get("hx_6_10", []) if n in female_staff_names]
@@ -567,6 +544,7 @@ if uploaded_file is not None:
     with col_hx6:
         rule_hx_26_end = st.multiselect("26일-말일", options=female_staff_names, default=default_hx_26_end)
         
+    # 저장 버튼
     if st.button("💾 현재 보건휴가(HX) 설정 저장"):
         save_hx_settings(rule_hx_1_5, rule_hx_6_10, rule_hx_11_15, rule_hx_16_20, rule_hx_21_25, rule_hx_26_end)
         st.success("✅ 보건휴가(HX) 지정 목록이 정상적으로 저장되었습니다! (다음번 접속 시 자동으로 불러옵니다)")
@@ -576,7 +554,6 @@ if uploaded_file is not None:
         'five_days': rule_five_days,
         'no_night': rule_no_night,
         'weekend_work': rule_weekend_work,
-        'not_together': [rule_not_1, rule_not_2, rule_not_3],
         'hx_1_5': rule_hx_1_5,
         'hx_6_10': rule_hx_6_10,
         'hx_11_15': rule_hx_11_15,
