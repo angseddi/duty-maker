@@ -17,7 +17,6 @@ MEN = ["최충일", "윤진호", "이용재"]
 LEADER = ["용하영", "최충일", "박세은", "김소은", "윤지선", "이소희", "정하림", "최아라"]
 SUB_LEADER = ["김민지", "박우영", "오지은"]
 
-# 보건휴가 설정 저장 파일
 HX_SETTINGS_FILE = "hx_settings.json"
 
 def load_hx_settings():
@@ -114,6 +113,16 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             if opt_list:
                 model.Add(sum(shifts[(e, abs_d, s)] for s in opt_list) == 1)
 
+        # [수정사항 1] 원티드/고정에 X가 포함되어 있고 실제로 그 날 X가 배정된다면, 전날 N 절대 불가
+        for d in range(num_days):
+            abs_d = num_history + d
+            opts = staff['fixed'].get(d, [])
+            if not opts:
+                opts = staff['wanted'].get(d, [])
+            
+            if 3 in opts: # 원티드에 오프(3)가 포함된 경우
+                model.AddImplication(shifts[(e, abs_d, 3)], shifts[(e, abs_d - 1, 2)].Not())
+
         # [C] 기본 규칙
         for d in range(total_days):
             model.AddExactlyOne(shifts[(e, d, s)] for s in range(4))
@@ -197,21 +206,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
         model.Add(off_count == target_offs) # 모든 사람 X 개수 완벽 통일
-        
-        # ★ 새로 추가된 보건휴가 시기 강제 배정 (하드 제약) ★
-        has_hx_fixed = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
-        if not staff['is_male'] and not has_hx_fixed:
-            target_hx_period = []
-            if name in custom_rules.get('hx_1_5', []): target_hx_period = range(0, min(5, num_days))
-            elif name in custom_rules.get('hx_6_10', []): target_hx_period = range(5, min(10, num_days))
-            elif name in custom_rules.get('hx_11_15', []): target_hx_period = range(10, min(15, num_days))
-            elif name in custom_rules.get('hx_16_20', []): target_hx_period = range(15, min(20, num_days))
-            elif name in custom_rules.get('hx_21_25', []): target_hx_period = range(20, min(25, num_days))
-            elif name in custom_rules.get('hx_26_end', []): target_hx_period = range(25, num_days)
-            
-            if target_hx_period:
-                # 선택된 날짜 구간 내에 무조건 최소 1개 이상의 휴무(O)를 배정해라!
-                model.Add(sum(shifts[(e, num_history + d, 3)] for d in target_hx_period) >= 1)
 
         # D와 E 갯수 비슷하게 맞추기
         d_count = sum(shifts[(e, num_history + d, 0)] for d in range(num_days))
@@ -257,12 +251,29 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
                 model.Add(sum(shifts[(e, abs_d, s)] for e in leader_indices) == 0).OnlyEnforceIf(has_leader.Not())
                 objective_terms.append(100 * has_leader)
 
-        model.Add(sum(shifts[(e, abs_d, 0)] for e in range(num_staff)) >= int(min_d))
-        model.Add(sum(shifts[(e, abs_d, 0)] for e in range(num_staff)) <= int(max_d))
-        model.Add(sum(shifts[(e, abs_d, 1)] for e in range(num_staff)) >= int(min_e))
-        model.Add(sum(shifts[(e, abs_d, 1)] for e in range(num_staff)) <= int(max_e))
-        model.Add(sum(shifts[(e, abs_d, 2)] for e in range(num_staff)) >= int(min_n))
-        model.Add(sum(shifts[(e, abs_d, 2)] for e in range(num_staff)) <= int(max_n))
+        d_count_global = sum(shifts[(e, abs_d, 0)] for e in range(num_staff))
+        e_count_global = sum(shifts[(e, abs_d, 1)] for e in range(num_staff))
+        n_count_global = sum(shifts[(e, abs_d, 2)] for e in range(num_staff))
+
+        model.Add(d_count_global >= int(min_d))
+        model.Add(d_count_global <= int(max_d))
+        model.Add(e_count_global >= int(min_e))
+        model.Add(e_count_global <= int(max_e))
+        model.Add(n_count_global >= int(min_n))
+        model.Add(n_count_global <= int(max_n))
+
+        # [수정사항 2] 하루 당 E >= N > D 조건 (강제 규칙)
+        model.Add(e_count_global >= n_count_global)
+        model.Add(n_count_global >= d_count_global + 1)
+
+    # [수정사항 3] 근무 겹침 방지 조합 (A와 B는 같은 날 D, E, N 불가)
+    for group in custom_rules.get('not_together', []):
+        if len(group) >= 2:
+            group_indices = [i for i, s in enumerate(staff_data) if s['name'] in group]
+            for d in range(num_days):
+                abs_d = num_history + d
+                for s in [0, 1, 2]: # D, E, N에 대해서만
+                    model.Add(sum(shifts[(e, abs_d, s)] for e in group_indices) <= 1)
 
     # N(나이트) 개수 균등 분배 
     n_balance_counts = []
@@ -302,7 +313,6 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         return True
     else:
         return False
-
 
 def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_n, max_n, custom_rules):
     wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
@@ -481,7 +491,7 @@ with st.sidebar:
     target_x = st.number_input("이번 달 기본 오프(X) 개수", min_value=1, max_value=15, value=8, step=1)
     
     st.header("👥 일별 근무자 인원수")
-    st.markdown("*(조건이 빡빡해서 에러가 날 경우 이 숫자를 조절해보세요)*")
+    st.markdown("*(무조건 **E ≥ N > D** 인원으로 배정되므로, 조건에 모순이 생기면 에러가 납니다)*")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -515,6 +525,18 @@ if uploaded_file is not None:
         rule_no_night = st.multiselect("🌙 나이트(N) 전면 배제 (N 0개)", options=staff_names)
         rule_weekend_work = st.multiselect("💪 주말(토,일) 근무 위주로 짤 사람", options=staff_names)
         
+    st.markdown("---")
+    st.subheader("🚫 근무 겹침 방지 조합")
+    st.markdown("같은 날 같은 근무(D, E, N)에 동시에 들어갈 수 없는 직원을 묶어주세요. (최대 3팀)")
+    
+    col_n1, col_n2, col_n3 = st.columns(3)
+    with col_n1:
+        rule_not_1 = st.multiselect("겹침 방지 1팀", options=staff_names)
+    with col_n2:
+        rule_not_2 = st.multiselect("겹침 방지 2팀", options=staff_names)
+    with col_n3:
+        rule_not_3 = st.multiselect("겹침 방지 3팀", options=staff_names)
+
     st.markdown("---")
     st.subheader("🌸 보건휴가(HX) 시기 지정")
     st.markdown("1일-5일, 6일-10일, 11일-15일, 16일-20일, 21일-25일, 26일-말일 중 지정할 수 있습니다.")
@@ -554,6 +576,7 @@ if uploaded_file is not None:
         'five_days': rule_five_days,
         'no_night': rule_no_night,
         'weekend_work': rule_weekend_work,
+        'not_together': [rule_not_1, rule_not_2, rule_not_3],
         'hx_1_5': rule_hx_1_5,
         'hx_6_10': rule_hx_6_10,
         'hx_11_15': rule_hx_11_15,
