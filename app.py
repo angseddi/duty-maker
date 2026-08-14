@@ -29,10 +29,17 @@ def load_hx_settings():
             return {}
     return {}
 
-def save_hx_settings(early, mid, late):
+def save_hx_settings(hx_1_5, hx_6_10, hx_11_15, hx_16_20, hx_21_25, hx_26_end):
     """현재 HX 설정 저장하기"""
     with open(HX_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"early": early, "mid": mid, "late": late}, f, ensure_ascii=False)
+        json.dump({
+            "hx_1_5": hx_1_5, 
+            "hx_6_10": hx_6_10, 
+            "hx_11_15": hx_11_15,
+            "hx_16_20": hx_16_20,
+            "hx_21_25": hx_21_25,
+            "hx_26_end": hx_26_end
+        }, f, ensure_ascii=False)
 
 def is_cell_colored(cell):
     """셀에 배경색(노란색 등)이 칠해져 있는지 확인"""
@@ -116,7 +123,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 0)].Not())
             model.AddImplication(shifts[(e, d, 2)], shifts[(e, d+1, 1)].Not())
             
-            # 근무 간 전환(D->E, E->N) 페널티 부여
+            # 근무 간 전환(D->E, E->N) 자체에 약한 페널티 부여
             for s1 in [0, 1, 2]:
                 for s2 in [0, 1, 2]:
                     if s1 != s2:
@@ -184,10 +191,13 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
         # [D] 당월 월간 목표 오프 카운트 산정
         fixed_h_tr_count = 0
+        has_hx_fixed = False
         for raw_val in staff.get('fixed_raw', {}).values():
             opts = [p.strip().upper() for p in str(raw_val).split(',')]
             if any(p in ['H', 'TR'] or '기타' in p or '교육' in p for p in opts):
                 fixed_h_tr_count += 1
+            if any('HX' in p for p in opts):
+                has_hx_fixed = True
                 
         target_offs = int(base_x_count) + fixed_h_tr_count
         if not staff['is_male']:
@@ -195,6 +205,20 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
 
         off_count = sum(shifts[(e, num_history + d, 3)] for d in range(num_days))
         model.Add(off_count == target_offs)
+
+        # ★ 새로운 마법: 지정된 기간에 HX(오프)가 무조건 1개 이상 존재하도록 AI에 강제 (하드 제약) ★
+        if not staff['is_male'] and not has_hx_fixed:
+            target_hx_period = []
+            if name in custom_rules.get('hx_1_5', []): target_hx_period = range(0, min(5, num_days))
+            elif name in custom_rules.get('hx_6_10', []): target_hx_period = range(5, min(10, num_days))
+            elif name in custom_rules.get('hx_11_15', []): target_hx_period = range(10, min(15, num_days))
+            elif name in custom_rules.get('hx_16_20', []): target_hx_period = range(15, min(20, num_days))
+            elif name in custom_rules.get('hx_21_25', []): target_hx_period = range(20, min(25, num_days))
+            elif name in custom_rules.get('hx_26_end', []): target_hx_period = range(25, num_days)
+            
+            if target_hx_period:
+                # 선택된 날짜 구간 내에 무조건 최소 1개 이상의 휴무(O)를 배정해라!
+                model.Add(sum(shifts[(e, num_history + d, 3)] for d in target_hx_period) >= 1)
 
         # D와 E 갯수 비슷하게 맞추기
         d_count = sum(shifts[(e, num_history + d, 0)] for d in range(num_days))
@@ -262,7 +286,7 @@ def solve_schedule(staff_data, num_days, num_history, base_x_count, min_d, max_d
         model.AddMinEquality(min_n_count, n_balance_counts)
         model.Add(max_n_count - min_n_count <= 1)
 
-    # [F] 원티드 반영 (가산점)
+    # [F] 원티드 반영
     for e, staff in enumerate(staff_data):
         for d, opt_list in staff['wanted'].items():
             abs_d = num_history + d
@@ -372,21 +396,29 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
         hx_target_d = -1
         has_hx_fixed = any('HX' in str(v).upper() for v in staff.get('fixed_raw', {}).values())
         if not staff['is_male'] and not has_hx_fixed:
-            ai_x_days = [d for d in range(num_days) if d not in staff['fixed'] and staff['final_schedule'].get(d, 3) == 3]
+            # AI가 배정한 전체 오프(X)와 사용자가 원티드/고정으로 적어둔 순수 오프(X)를 모두 후보군으로 확보
+            all_x_days = [d for d in range(num_days) if staff['final_schedule'].get(d, 3) == 3]
+            valid_hx_days = []
+            for d in all_x_days:
+                if d in staff['fixed']:
+                    raw_opts = [p.strip().upper() for p in str(staff['fixed_raw'].get(d, '')).split(',')]
+                    if any(p in ['X', 'XX', 'O'] for p in raw_opts): 
+                        valid_hx_days.append(d)
+                else:
+                    valid_hx_days.append(d)
             
-            if name in custom_rules.get('hx_early', []):
-                preferred = [d for d in ai_x_days if 0 <= d < 10]
-            elif name in custom_rules.get('hx_mid', []):
-                preferred = [d for d in ai_x_days if 10 <= d < 20]
-            elif name in custom_rules.get('hx_late', []):
-                preferred = [d for d in ai_x_days if 20 <= d]
-            else:
-                preferred = ai_x_days
+            preferred = []
+            if name in custom_rules.get('hx_1_5', []): preferred = [d for d in valid_hx_days if 0 <= d <= 4]
+            elif name in custom_rules.get('hx_6_10', []): preferred = [d for d in valid_hx_days if 5 <= d <= 9]
+            elif name in custom_rules.get('hx_11_15', []): preferred = [d for d in valid_hx_days if 10 <= d <= 14]
+            elif name in custom_rules.get('hx_16_20', []): preferred = [d for d in valid_hx_days if 15 <= d <= 19]
+            elif name in custom_rules.get('hx_21_25', []): preferred = [d for d in valid_hx_days if 20 <= d <= 24]
+            elif name in custom_rules.get('hx_26_end', []): preferred = [d for d in valid_hx_days if 25 <= d]
             
             if preferred:
                 hx_target_d = preferred[0]
-            elif ai_x_days:
-                hx_target_d = ai_x_days[0]
+            elif valid_hx_days:
+                hx_target_d = valid_hx_days[0]
         # ---------------------------------------------
         
         for d in range(num_days):
@@ -404,6 +436,10 @@ def process_excel(file_content, target_x_count, min_d, max_d, min_e, max_e, min_
                     elif chosen_idx == 1 and 'E' in p: val = p; break
                     elif chosen_idx == 2 and 'N' in p: val = p; break
                     elif chosen_idx == 3 and (p in ['X', 'SX', 'H', 'HX', 'TR', 'O', 'XX'] or '기타' in p or '교육' in p): val = p; break
+                
+                # 타겟 날짜라면 묻고 따지지도 않고 HX로 변환
+                if d == hx_target_d:
+                    val = 'HX'
             else:
                 val = REV_SHIFT_IDX[chosen_idx]
                 if d == hx_target_d:
@@ -485,25 +521,36 @@ if uploaded_file is not None:
         
     st.markdown("---")
     st.subheader("🌸 보건휴가(HX) 시기 지정")
-    st.markdown("월초(1일-10일), 중순(11일-20일), 월말(21일-말일) 중 HX가 들어갈 시기를 고정할 수 있습니다.")
+    st.markdown("1일-5일, 6일-10일, 11일-15일, 16일-20일, 21일-25일, 26일-말일 중 지정할 수 있습니다.")
     
     # 이전에 저장해둔 HX 설정 불러오기
     hx_settings = load_hx_settings()
-    default_hx_early = [n for n in hx_settings.get("early", []) if n in female_staff_names]
-    default_hx_mid = [n for n in hx_settings.get("mid", []) if n in female_staff_names]
-    default_hx_late = [n for n in hx_settings.get("late", []) if n in female_staff_names]
+    default_hx_1_5 = [n for n in hx_settings.get("hx_1_5", []) if n in female_staff_names]
+    default_hx_6_10 = [n for n in hx_settings.get("hx_6_10", []) if n in female_staff_names]
+    default_hx_11_15 = [n for n in hx_settings.get("hx_11_15", []) if n in female_staff_names]
+    default_hx_16_20 = [n for n in hx_settings.get("hx_16_20", []) if n in female_staff_names]
+    default_hx_21_25 = [n for n in hx_settings.get("hx_21_25", []) if n in female_staff_names]
+    default_hx_26_end = [n for n in hx_settings.get("hx_26_end", []) if n in female_staff_names]
     
     col_hx1, col_hx2, col_hx3 = st.columns(3)
     with col_hx1:
-        rule_hx_early = st.multiselect("월초 (1일-10일)", options=female_staff_names, default=default_hx_early)
+        rule_hx_1_5 = st.multiselect("1일-5일", options=female_staff_names, default=default_hx_1_5)
     with col_hx2:
-        rule_hx_mid = st.multiselect("중순 (11일-20일)", options=female_staff_names, default=default_hx_mid)
+        rule_hx_6_10 = st.multiselect("6일-10일", options=female_staff_names, default=default_hx_6_10)
     with col_hx3:
-        rule_hx_late = st.multiselect("월말 (21일-말일)", options=female_staff_names, default=default_hx_late)
+        rule_hx_11_15 = st.multiselect("11일-15일", options=female_staff_names, default=default_hx_11_15)
+        
+    col_hx4, col_hx5, col_hx6 = st.columns(3)
+    with col_hx4:
+        rule_hx_16_20 = st.multiselect("16일-20일", options=female_staff_names, default=default_hx_16_20)
+    with col_hx5:
+        rule_hx_21_25 = st.multiselect("21일-25일", options=female_staff_names, default=default_hx_21_25)
+    with col_hx6:
+        rule_hx_26_end = st.multiselect("26일-말일", options=female_staff_names, default=default_hx_26_end)
         
     # 저장 버튼
     if st.button("💾 현재 보건휴가(HX) 설정 저장"):
-        save_hx_settings(rule_hx_early, rule_hx_mid, rule_hx_late)
+        save_hx_settings(rule_hx_1_5, rule_hx_6_10, rule_hx_11_15, rule_hx_16_20, rule_hx_21_25, rule_hx_26_end)
         st.success("✅ 보건휴가(HX) 지정 목록이 정상적으로 저장되었습니다! (다음번 접속 시 자동으로 불러옵니다)")
         
     custom_rules_dict = {
@@ -511,9 +558,12 @@ if uploaded_file is not None:
         'five_days': rule_five_days,
         'no_night': rule_no_night,
         'weekend_work': rule_weekend_work,
-        'hx_early': rule_hx_early,
-        'hx_mid': rule_hx_mid,
-        'hx_late': rule_hx_late
+        'hx_1_5': rule_hx_1_5,
+        'hx_6_10': rule_hx_6_10,
+        'hx_11_15': rule_hx_11_15,
+        'hx_16_20': rule_hx_16_20,
+        'hx_21_25': rule_hx_21_25,
+        'hx_26_end': rule_hx_26_end
     }
     st.markdown("---")
     
